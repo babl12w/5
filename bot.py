@@ -1,451 +1,407 @@
 import asyncio
-import io
 import logging
 import os
 import random
 import re
+import tempfile
 from dataclasses import dataclass
-from typing import Any
+from pathlib import Path
+from typing import Optional
 from urllib.parse import quote_plus, urljoin
 
 import aiohttp
 import feedparser
-from aiogram import Bot, Dispatcher, F, Router
-from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramBadRequest
-from aiogram.filters import CommandStart
+from aiogram import Bot, Dispatcher, F
+from aiogram.enums import PollType
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import BufferedInputFile, KeyboardButton, Message, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from aiogram.types import FSInputFile, KeyboardButton, Message, ReplyKeyboardMarkup
 from bs4 import BeautifulSoup
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-UNSPLASH_ACCESS_KEY = os.getenv("UNSPLASH_ACCESS_KEY")
-ADMIN_ID = int(os.getenv("ADMIN_ID"))
-CHANNEL_ID = os.getenv("CHANNEL_ID")
-
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is required")
-if not UNSPLASH_ACCESS_KEY:
-    raise RuntimeError("UNSPLASH_ACCESS_KEY is required")
-if not CHANNEL_ID:
-    raise RuntimeError("CHANNEL_ID is required")
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
-logger = logging.getLogger("music_bot")
-
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36"
-)
-HTTP_TIMEOUT = aiohttp.ClientTimeout(total=20, connect=10, sock_read=20)
-MAX_AUDIO_BYTES = 20 * 1024 * 1024
-MAX_IMAGE_BYTES = 10 * 1024 * 1024
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+UNSPLASH_ACCESS_KEY = os.getenv("UNSPLASH_ACCESS_KEY", "")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "123456789"))
+CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-1001234567890"))
 
 GENRES = ["Pop", "Rock", "Rap", "Electronic"]
-POLL_OPTIONS: dict[str, list[str]] = {
-    "Опитування 1": ["🔥 Топ", "🎧 Норм", "⏭ Скіп"],
-    "Опитування 2": ["Pop", "Rock", "Rap", "Electronic"],
-    "Опитування 3": ["Ранок", "День", "Вечір", "Ніч"],
-    "Опитування 4": ["Більше треків", "Більше цитат", "Більше фото"],
+POLL_OPTIONS = {
+    "Опитування 1": ("Який жанр сьогодні?", ["Pop", "Rock", "Rap", "Electronic"]),
+    "Опитування 2": ("Коли слухаєш музику найчастіше?", ["Зранку", "Вдень", "Увечері", "Вночі"]),
+    "Опитування 3": ("Що сьогодні вмикаємо?", ["Хіти", "Новинки", "Ретро", "Мікс"]),
 }
-
-QUOTE_FEEDS = [
+RSS_SOURCES = [
     "https://www.brainyquote.com/link/quotebr.rss",
+    "https://www.inc.com/rss",
     "https://feeds.feedburner.com/quotationspage/qotd",
 ]
 
-FALLBACK_TRACKS = [
-    {
-        "title": "SoundHelix Song 1",
-        "artist": "SoundHelix",
-        "url": "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3",
-    },
-    {
-        "title": "SoundHelix Song 2",
-        "artist": "SoundHelix",
-        "url": "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-2.mp3",
-    },
-    {
-        "title": "Sample Audio",
-        "artist": "Pixabay",
-        "url": "https://cdn.pixabay.com/download/audio/2022/03/15/audio_c8f2f7f2f5.mp3",
-    },
-]
-
-GENRE_KEYWORDS = {
-    "Pop": "pop music vibes",
-    "Rock": "rock concert vibes",
-    "Rap": "hip hop street vibes",
-    "Electronic": "electronic neon vibes",
-}
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger("music_bot")
 
 
 @dataclass
 class Track:
     title: str
     artist: str
-    url: str
+    source_url: str
+    file_path: Path
 
 
-@dataclass
-class PostPackage:
-    genre: str
-    quote: str
-    image_bytes: bytes
-    image_name: str
-    tracks: list[Track]
-
-
-class FlowState(StatesGroup):
+class UserStates(StatesGroup):
     choosing_genre = State()
     choosing_poll = State()
     confirm_publish = State()
 
 
-router = Router()
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
+bot = Bot(BOT_TOKEN)
 
-MAIN_MENU = ReplyKeyboardMarkup(
+
+main_menu = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="Новий пост")],
-        [KeyboardButton(text="Опитування")],
+        [KeyboardButton(text="Новий пост"), KeyboardButton(text="Опитування")],
         [KeyboardButton(text="Скасувати")],
     ],
     resize_keyboard=True,
 )
 
-GENRE_MENU = ReplyKeyboardMarkup(
+genre_menu = ReplyKeyboardMarkup(
     keyboard=[[KeyboardButton(text=g)] for g in GENRES] + [[KeyboardButton(text="Скасувати")]],
     resize_keyboard=True,
 )
 
-PUBLISH_MENU = ReplyKeyboardMarkup(
-    keyboard=[[KeyboardButton(text="Опублікувати")], [KeyboardButton(text="Скасувати")]],
+polls_menu = ReplyKeyboardMarkup(
+    keyboard=[[KeyboardButton(text=p)] for p in POLL_OPTIONS.keys()] + [[KeyboardButton(text="Скасувати")]],
     resize_keyboard=True,
 )
 
-POLL_MENU = ReplyKeyboardMarkup(
-    keyboard=[[KeyboardButton(text=name)] for name in POLL_OPTIONS] + [[KeyboardButton(text="Скасувати")]],
+publish_menu = ReplyKeyboardMarkup(
+    keyboard=[[KeyboardButton(text="Опублікувати"), KeyboardButton(text="Скасувати")]],
     resize_keyboard=True,
 )
 
 
-async def http_get_text(session: aiohttp.ClientSession, url: str) -> str:
-    headers = {"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9"}
-    async with session.get(url, headers=headers) as response:
-        response.raise_for_status()
-        return await response.text()
-
-
-async def download_bytes(session: aiohttp.ClientSession, url: str, max_bytes: int) -> bytes | None:
-    headers = {"User-Agent": USER_AGENT, "Referer": url}
+async def fetch_text(session: aiohttp.ClientSession, url: str) -> str:
     try:
-        async with session.get(url, headers=headers) as response:
+        async with session.get(url, timeout=20) as response:
+            if response.status == 200:
+                return await response.text()
+    except Exception as e:
+        logger.warning("Fetch text failed for %s: %s", url, e)
+    return ""
+
+
+def normalize_title(raw: str) -> tuple[str, str]:
+    cleaned = re.sub(r"\s+", " ", raw).strip(" -_\n\t")
+    if " - " in cleaned:
+        artist, title = cleaned.split(" - ", 1)
+        return title.strip()[:100], artist.strip()[:100]
+    return cleaned[:100] or "Unknown Track", "Unknown Artist"
+
+
+def collect_mp3_candidates(html: str, base_url: str) -> list[tuple[str, str]]:
+    if not html:
+        return []
+    soup = BeautifulSoup(html, "html.parser")
+    candidates: list[tuple[str, str]] = []
+    seen = set()
+
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if ".mp3" in href.lower():
+            full_url = urljoin(base_url, href)
+            text = a.get_text(" ", strip=True) or Path(href).stem
+            title, artist = normalize_title(text)
+            key = (full_url, title, artist)
+            if key not in seen:
+                seen.add(key)
+                candidates.append((full_url, f"{artist} - {title}"))
+
+    script_matches = re.findall(r"https?://[^\"'\s]+\.mp3[^\"'\s]*", html, flags=re.IGNORECASE)
+    for link in script_matches:
+        if link not in [c[0] for c in candidates]:
+            stem = Path(link.split("?")[0]).stem.replace("_", " ").replace("-", " ")
+            title, artist = normalize_title(stem)
+            candidates.append((link, f"{artist} - {title}"))
+
+    return candidates
+
+
+async def download_track(session: aiohttp.ClientSession, url: str, title_hint: str) -> Optional[Track]:
+    try:
+        async with session.get(url, timeout=30) as response:
             if response.status != 200:
                 return None
-            content = bytearray()
-            async for chunk in response.content.iter_chunked(65536):
-                content.extend(chunk)
-                if len(content) > max_bytes:
-                    return None
-            return bytes(content)
-    except Exception:
-        logger.exception("Download failed: %s", url)
+            content = await response.read()
+            if len(content) < 10240:
+                return None
+            temp_dir = Path(tempfile.gettempdir()) / "music_bot_tracks"
+            temp_dir.mkdir(parents=True, exist_ok=True)
+            filename = re.sub(r"[^a-zA-Z0-9а-яА-ЯіїєІЇЄ_-]+", "_", title_hint)[:70] or "track"
+            file_path = temp_dir / f"{filename}_{random.randint(1000,9999)}.mp3"
+            file_path.write_bytes(content)
+            title, artist = normalize_title(title_hint)
+            return Track(title=title, artist=artist, source_url=url, file_path=file_path)
+    except Exception as e:
+        logger.warning("Download track failed for %s: %s", url, e)
         return None
 
 
-def dedupe_tracks(items: list[Track]) -> list[Track]:
-    seen: set[str] = set()
-    result: list[Track] = []
-    for item in items:
-        key = item.url.strip().lower()
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        result.append(item)
-    return result
+async def fetch_tracks_for_genre(genre: str) -> list[Track]:
+    queries = [
+        f"https://z3.fm/search?keywords={quote_plus(genre)}",
+        f"https://sefon.pro/search/{quote_plus(genre)}",
+        "https://muzcore.online/top-100.html",
+        "https://file-examples.com/index.php/sample-audio-files/",
+    ]
+    fallback_mp3 = [
+        ("https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3", "SoundHelix - Song 1"),
+        ("https://www.soundhelix.com/examples/mp3/SoundHelix-Song-2.mp3", "SoundHelix - Song 2"),
+    ]
+    downloaded: list[Track] = []
 
-
-def parse_title_artist(raw: str) -> tuple[str, str]:
-    clean = re.sub(r"\s+", " ", raw).strip(" -\n\t")
-    if " - " in clean:
-        artist, title = clean.split(" - ", 1)
-        return title.strip(), artist.strip()
-    return clean[:100] or "Unknown track", "Unknown artist"
-
-
-async def search_z3fm(session: aiohttp.ClientSession, genre: str) -> list[Track]:
-    query = quote_plus(f"{genre} music")
-    url = f"https://z3.fm/search?keywords={query}"
-    tracks: list[Track] = []
-    try:
-        html = await http_get_text(session, url)
-        soup = BeautifulSoup(html, "html.parser")
-        for tag in soup.select("a[href$='.mp3'], a[data-url]"):
-            track_url = tag.get("href") or tag.get("data-url")
-            if not track_url:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    }
+    async with aiohttp.ClientSession(headers=headers) as session:
+        for idx, search_url in enumerate(queries, start=1):
+            if len(downloaded) >= 2:
+                break
+            html = await fetch_text(session, search_url)
+            candidates = collect_mp3_candidates(html, search_url)
+            if idx < 4 and len(candidates) < 2:
                 continue
-            full_url = urljoin("https://z3.fm", track_url)
-            text = tag.get_text(" ", strip=True) or tag.get("title", "")
-            title, artist = parse_title_artist(text)
-            tracks.append(Track(title=title, artist=artist, url=full_url))
-        if not tracks:
-            for mp3 in set(re.findall(r"https?://[^\"']+\.mp3[^\"']*", html)):
-                tracks.append(Track(title="Unknown track", artist="Unknown artist", url=mp3))
-    except Exception:
-        logger.exception("z3.fm search failed")
-    return dedupe_tracks(tracks)
+            if idx == 4 and not candidates:
+                candidates = fallback_mp3
+            for mp3_url, title_hint in candidates:
+                if len(downloaded) >= 2:
+                    break
+                if any(t.source_url == mp3_url for t in downloaded):
+                    continue
+                track = await download_track(session, mp3_url, title_hint)
+                if track:
+                    downloaded.append(track)
+
+        if len(downloaded) < 2:
+            for mp3_url, title_hint in fallback_mp3:
+                if len(downloaded) >= 2:
+                    break
+                if any(t.source_url == mp3_url for t in downloaded):
+                    continue
+                track = await download_track(session, mp3_url, title_hint)
+                if track:
+                    downloaded.append(track)
+    return downloaded
 
 
-async def search_sefon(session: aiohttp.ClientSession) -> list[Track]:
-    url = "https://sefon.pro/"
-    tracks: list[Track] = []
-    try:
-        html = await http_get_text(session, url)
-        soup = BeautifulSoup(html, "html.parser")
-        for row in soup.select("div, li, article"):
-            text = row.get_text(" ", strip=True)
-            link = row.find("a", href=True)
-            if link and ".mp3" in link["href"]:
-                full_url = urljoin(url, link["href"])
-                title, artist = parse_title_artist(text)
-                tracks.append(Track(title=title, artist=artist, url=full_url))
-        if not tracks:
-            for mp3 in set(re.findall(r"https?://[^\"']+\.mp3[^\"']*", html)):
-                tracks.append(Track(title="Unknown track", artist="Unknown artist", url=mp3))
-    except Exception:
-        logger.exception("sefon.pro search failed")
-    return dedupe_tracks(tracks)
-
-
-async def search_muzcore(session: aiohttp.ClientSession) -> list[Track]:
-    url = "https://muzcore.online/top-100.html"
-    tracks: list[Track] = []
-    try:
-        html = await http_get_text(session, url)
-        soup = BeautifulSoup(html, "html.parser")
-        for row in soup.select("tr, li, div"):
-            text = row.get_text(" ", strip=True)
-            link = row.find("a", href=True)
-            if link and ".mp3" in link["href"]:
-                full_url = urljoin(url, link["href"])
-                title, artist = parse_title_artist(text)
-                tracks.append(Track(title=title, artist=artist, url=full_url))
-        if not tracks:
-            for mp3 in set(re.findall(r"https?://[^\"']+\.mp3[^\"']*", html)):
-                tracks.append(Track(title="Unknown track", artist="Unknown artist", url=mp3))
-    except Exception:
-        logger.exception("muzcore search failed")
-    return dedupe_tracks(tracks)
-
-
-async def collect_tracks(session: aiohttp.ClientSession, genre: str) -> list[Track]:
-    aggregated: list[Track] = []
-
-    for provider in (
-        lambda: search_z3fm(session, genre),
-        lambda: search_sefon(session),
-        lambda: search_muzcore(session),
-    ):
-        if len(aggregated) >= 2:
-            break
-        try:
-            found = await provider()
-            aggregated.extend(found)
-            aggregated = dedupe_tracks(aggregated)
-        except Exception:
-            logger.exception("Provider failed")
-
-    if len(aggregated) < 2:
-        aggregated.extend(Track(**item) for item in FALLBACK_TRACKS)
-        aggregated = dedupe_tracks(aggregated)
-
-    if not aggregated:
-        aggregated = [Track(**FALLBACK_TRACKS[0])]
-
-    return aggregated[:2] if len(aggregated) >= 2 else aggregated[:1]
-
-
-async def get_unsplash_image(session: aiohttp.ClientSession, genre: str) -> bytes:
-    query = GENRE_KEYWORDS.get(genre, genre)
+async def fetch_unsplash_photo(genre: str) -> Optional[Path]:
+    if not UNSPLASH_ACCESS_KEY:
+        return None
     url = "https://api.unsplash.com/photos/random"
-    params = {"query": query, "orientation": "landscape", "content_filter": "high"}
-    headers = {"Authorization": f"Client-ID {UNSPLASH_ACCESS_KEY}", "Accept-Version": "v1"}
-
+    params = {
+        "query": f"{genre} music vibe",
+        "orientation": "portrait",
+        "content_filter": "high",
+        "client_id": UNSPLASH_ACCESS_KEY,
+    }
     try:
-        async with session.get(url, params=params, headers=headers) as response:
-            response.raise_for_status()
-            payload = await response.json()
-        img_url = payload.get("urls", {}).get("regular")
-        if img_url:
-            image = await download_bytes(session, img_url, MAX_IMAGE_BYTES)
-            if image:
-                return image
-    except Exception:
-        logger.exception("Unsplash fetch failed")
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params, timeout=25) as response:
+                if response.status != 200:
+                    return None
+                data = await response.json()
+                image_url = data.get("urls", {}).get("regular") or data.get("urls", {}).get("full")
+                if not image_url:
+                    return None
+            async with session.get(image_url, timeout=25) as img_response:
+                if img_response.status != 200:
+                    return None
+                content = await img_response.read()
+                temp_dir = Path(tempfile.gettempdir()) / "music_bot_images"
+                temp_dir.mkdir(parents=True, exist_ok=True)
+                file_path = temp_dir / f"{genre.lower()}_{random.randint(1000,9999)}.jpg"
+                file_path.write_bytes(content)
+                return file_path
+    except Exception as e:
+        logger.warning("Unsplash fetch failed: %s", e)
+        return None
 
-    fallback = "https://images.unsplash.com/photo-1470225620780-dba8ba36b745?fit=crop&w=1400&q=80"
-    image = await download_bytes(session, fallback, MAX_IMAGE_BYTES)
-    if image:
-        return image
-    raise RuntimeError("Image download failed")
+
+def shorten_lines(text: str) -> str:
+    fragments = [x.strip() for x in re.split(r"[\n\.\!\?]+", text) if x.strip()]
+    if not fragments:
+        return "Музика — це мова емоцій, яка не потребує перекладу."
+    max_lines = random.randint(2, 4)
+    chosen = fragments[:max_lines]
+    return "\n".join(chosen)
 
 
-async def get_random_quote(session: aiohttp.ClientSession) -> str:
-    entries: list[str] = []
-    for feed_url in QUOTE_FEEDS:
+async def fetch_quote() -> str:
+    random.shuffle(RSS_SOURCES)
+    loop = asyncio.get_running_loop()
+    for source in RSS_SOURCES:
         try:
-            content = await http_get_text(session, feed_url)
-            feed = feedparser.parse(content)
-            for entry in feed.entries[:20]:
-                text = re.sub(r"<[^>]+>", "", entry.get("summary", "") or entry.get("title", ""))
-                text = re.sub(r"\s+", " ", text).strip()
-                if len(text.split()) < 8:
-                    continue
-                parts = [p.strip() for p in re.split(r"[.!?]", text) if p.strip()]
-                if not parts:
-                    continue
-                lines = parts[: min(4, max(2, len(parts)))]
-                quote = "\n".join(lines[:4])
-                entries.append(quote)
-        except Exception:
-            logger.exception("Quote feed failed: %s", feed_url)
-
-    if not entries:
-        return "Music gives a soul to the universe\nWings to the mind\nFlight to the imagination"
-    return random.choice(entries)
+            feed = await loop.run_in_executor(None, lambda: feedparser.parse(source))
+            if not feed.entries:
+                continue
+            entry = random.choice(feed.entries)
+            raw_text = f"{entry.get('title', '')}. {entry.get('summary', '')}"
+            raw_text = BeautifulSoup(raw_text, "html.parser").get_text(" ", strip=True)
+            quote = shorten_lines(raw_text)
+            if len(quote) >= 30:
+                return quote
+        except Exception as e:
+            logger.warning("Quote fetch failed for %s: %s", source, e)
+    return "Музика говорить там, де слова закінчуються.\nСлухай серцем."
 
 
-async def build_package(session: aiohttp.ClientSession, genre: str, bot: Bot) -> PostPackage:
-    quote_task = asyncio.create_task(get_random_quote(session))
-    image_task = asyncio.create_task(get_unsplash_image(session, genre))
-    tracks_task = asyncio.create_task(collect_tracks(session, genre))
+def build_caption(quote: str, tracks: list[Track]) -> str:
+    lines = [f"📝 {quote}", "", "🎵 Треки дня:"]
+    for idx, track in enumerate(tracks, start=1):
+        lines.append(f"{idx}. {track.artist} — {track.title}")
+    return "\n".join(lines)
 
-    quote, image_bytes, tracks = await asyncio.gather(quote_task, image_task, tracks_task)
 
-    if len(tracks) < 2:
+async def cleanup_files(paths: list[Path]) -> None:
+    for path in paths:
         try:
-            await bot.send_message(ADMIN_ID, "Не вдалося знайти 2 треки. Опубліковано 1.")
-        except TelegramBadRequest:
-            logger.warning("Could not notify admin")
+            if path and path.exists():
+                path.unlink(missing_ok=True)
+        except Exception as e:
+            logger.warning("Cleanup failed for %s: %s", path, e)
 
-    return PostPackage(
+
+@dp.message(Command("start"))
+async def start_handler(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer("Головне меню", reply_markup=main_menu)
+
+
+@dp.message(F.text == "Скасувати")
+async def cancel_handler(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    files_to_remove: list[Path] = []
+    for key in ["photo", "tracks"]:
+        item = data.get(key)
+        if isinstance(item, str):
+            files_to_remove.append(Path(item))
+        if isinstance(item, list):
+            files_to_remove.extend(Path(x.get("file_path")) for x in item if x.get("file_path"))
+    await cleanup_files(files_to_remove)
+    await state.clear()
+    await message.answer("Скасовано. Головне меню", reply_markup=main_menu)
+
+
+@dp.message(F.text == "Новий пост")
+async def new_post_handler(message: Message, state: FSMContext) -> None:
+    await state.set_state(UserStates.choosing_genre)
+    await message.answer("Оберіть жанр", reply_markup=genre_menu)
+
+
+@dp.message(UserStates.choosing_genre, F.text.in_(GENRES))
+async def genre_handler(message: Message, state: FSMContext) -> None:
+    genre = message.text
+    await message.answer("Готую пост, зачекай...", reply_markup=main_menu)
+    tracks = await fetch_tracks_for_genre(genre)
+    quote = await fetch_quote()
+    photo_path = await fetch_unsplash_photo(genre)
+
+    serialized_tracks = [
+        {
+            "title": t.title,
+            "artist": t.artist,
+            "source_url": t.source_url,
+            "file_path": str(t.file_path),
+        }
+        for t in tracks
+    ]
+
+    await state.update_data(
         genre=genre,
         quote=quote,
-        image_bytes=image_bytes,
-        image_name=f"{genre.lower()}_vibe.jpg",
-        tracks=tracks,
+        tracks=serialized_tracks,
+        photo=str(photo_path) if photo_path else "",
+        poll_title="",
     )
+    await state.set_state(UserStates.confirm_publish)
+    await message.answer("Пост підготовлено. Натисни «Опублікувати» або «Скасувати».", reply_markup=publish_menu)
 
 
-async def publish_package(bot: Bot, session: aiohttp.ClientSession, package: PostPackage, poll_name: str | None) -> None:
-    photo = BufferedInputFile(package.image_bytes, filename=package.image_name)
-    await bot.send_photo(chat_id=CHANNEL_ID, photo=photo, caption=package.quote)
-
-    for idx, track in enumerate(package.tracks, start=1):
-        audio_bytes = await download_bytes(session, track.url, MAX_AUDIO_BYTES)
-        if not audio_bytes:
-            logger.warning("Skip audio: %s", track.url)
-            continue
-        audio = BufferedInputFile(audio_bytes, filename=f"track_{idx}.mp3")
-        await bot.send_audio(
-            chat_id=CHANNEL_ID,
-            audio=audio,
-            title=track.title,
-            performer=track.artist,
-        )
-
-    if poll_name and poll_name in POLL_OPTIONS:
-        options = POLL_OPTIONS[poll_name]
-        await bot.send_poll(
-            chat_id=CHANNEL_ID,
-            question=poll_name,
-            options=options,
-            is_anonymous=False,
-        )
+@dp.message(F.text == "Опитування")
+async def poll_select_handler(message: Message, state: FSMContext) -> None:
+    await state.set_state(UserStates.choosing_poll)
+    await message.answer("Обери опитування", reply_markup=polls_menu)
 
 
-async def get_session(state: FSMContext) -> dict[str, Any]:
+@dp.message(UserStates.choosing_poll, F.text.in_(list(POLL_OPTIONS.keys())))
+async def poll_chosen_handler(message: Message, state: FSMContext) -> None:
+    await state.update_data(poll_title=message.text)
+    await state.set_state(UserStates.confirm_publish)
+    await message.answer("Опитування вибрано. Натисни «Опублікувати» або «Скасувати».", reply_markup=publish_menu)
+
+
+@dp.message(F.text == "Опублікувати")
+async def publish_handler(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
-    return data
+    tracks_data = data.get("tracks", [])
+    quote = data.get("quote", "")
+    poll_title = data.get("poll_title", "")
+    photo = data.get("photo", "")
+
+    if not tracks_data and not poll_title:
+        await message.answer("Спочатку створи пост або обери опитування.", reply_markup=main_menu)
+        await state.clear()
+        return
+
+    tracks = [Track(t["title"], t["artist"], t["source_url"], Path(t["file_path"])) for t in tracks_data]
+    sent_files: list[Path] = []
+
+    try:
+        if tracks:
+            caption = build_caption(quote, tracks)
+            if photo and Path(photo).exists():
+                await bot.send_photo(CHANNEL_ID, photo=FSInputFile(photo), caption=caption)
+                sent_files.append(Path(photo))
+            else:
+                await bot.send_message(CHANNEL_ID, caption)
+
+            for track in tracks:
+                if track.file_path.exists():
+                    await bot.send_audio(
+                        CHANNEL_ID,
+                        audio=FSInputFile(track.file_path),
+                        title=track.title,
+                        performer=track.artist,
+                    )
+                    sent_files.append(track.file_path)
+
+            if len(tracks) == 1:
+                await bot.send_message(ADMIN_ID, "Не вдалося знайти 2 треки, опубліковано 1.")
+
+        if poll_title:
+            q, options = POLL_OPTIONS[poll_title]
+            await bot.send_poll(CHANNEL_ID, question=q, options=options, is_anonymous=False, type=PollType.REGULAR)
+
+        await message.answer("Опубліковано.", reply_markup=main_menu)
+    except Exception as e:
+        logger.exception("Publish failed: %s", e)
+        await message.answer("Помилка під час публікації.", reply_markup=main_menu)
+    finally:
+        await cleanup_files(sent_files)
+        await state.clear()
 
 
-@router.message(CommandStart())
-async def cmd_start(message: Message, state: FSMContext) -> None:
-    await state.clear()
-    await message.answer("Головне меню", reply_markup=MAIN_MENU)
-
-
-@router.message(F.text == "Скасувати")
-async def cancel_flow(message: Message, state: FSMContext) -> None:
-    await state.clear()
-    await message.answer("Скасовано. Повертаю в меню.", reply_markup=MAIN_MENU)
-
-
-@router.message(F.text == "Новий пост")
-async def new_post(message: Message, state: FSMContext) -> None:
-    await state.set_state(FlowState.choosing_genre)
-    await message.answer("Обери жанр:", reply_markup=GENRE_MENU)
-
-
-@router.message(FlowState.choosing_genre, F.text.in_(GENRES))
-async def choose_genre(message: Message, state: FSMContext, bot: Bot) -> None:
-    genre = message.text
-    await message.answer("Формую пост, зачекай кілька секунд...", reply_markup=ReplyKeyboardRemove())
-
-    async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT) as session:
-        package = await build_package(session, genre, bot)
-
-    await state.update_data(package=package, genre=genre)
-    await state.set_state(FlowState.choosing_poll)
-    await message.answer("Пост готовий. Тепер обери опитування:", reply_markup=POLL_MENU)
-
-
-@router.message(F.text == "Опитування")
-async def poll_entry(message: Message, state: FSMContext) -> None:
-    await state.set_state(FlowState.choosing_poll)
-    await message.answer("Обери опитування:", reply_markup=POLL_MENU)
-
-
-@router.message(FlowState.choosing_poll, F.text.in_(list(POLL_OPTIONS.keys())))
-async def choose_poll(message: Message, state: FSMContext) -> None:
-    await state.update_data(selected_poll=message.text)
-    await state.set_state(FlowState.confirm_publish)
-    await message.answer("Натисни 'Опублікувати' або 'Скасувати'.", reply_markup=PUBLISH_MENU)
-
-
-@router.message(FlowState.confirm_publish, F.text == "Опублікувати")
-async def publish_now(message: Message, state: FSMContext, bot: Bot) -> None:
-    data = await get_session(state)
-    poll_name = data.get("selected_poll")
-    package: PostPackage | None = data.get("package")
-    genre = data.get("genre", "Pop")
-
-    await message.answer("Публікую...", reply_markup=ReplyKeyboardRemove())
-
-    async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT) as session:
-        if package is None:
-            package = await build_package(session, genre, bot)
-        await publish_package(bot, session, package, poll_name)
-
-    await state.clear()
-    await message.answer("Опубліковано ✅", reply_markup=MAIN_MENU)
-
-
-@router.message()
+@dp.message()
 async def fallback_handler(message: Message) -> None:
-    await message.answer("Обери дію з меню.", reply_markup=MAIN_MENU)
+    await message.answer("Оберіть дію з меню", reply_markup=main_menu)
 
 
 async def main() -> None:
-    bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
-    dp = Dispatcher(storage=MemoryStorage())
-    dp.include_router(router)
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN is not set")
     await dp.start_polling(bot)
 
 
