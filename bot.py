@@ -1,625 +1,638 @@
 import asyncio
+import html
 import logging
 import os
 import random
 import re
-import tempfile
-import uuid
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 import aiohttp
 import feedparser
-from aiogram import Bot, Dispatcher, F, Router
-from aiogram.client.default import DefaultBotProperties
+from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
-    FSInputFile,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
     KeyboardButton,
     Message,
     ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
 )
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-UNSPLASH_ACCESS_KEY = os.getenv("UNSPLASH_ACCESS_KEY", "").strip()
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0").strip() or "0")
-CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+UNSPLASH_ACCESS_KEY = os.getenv("UNSPLASH_ACCESS_KEY", "")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+CHANNEL_ID = os.getenv("CHANNEL_ID", "")
+JAMENDO_CLIENT_ID = os.getenv("JAMENDO_CLIENT_ID", "")
 
-if not BOT_TOKEN or not UNSPLASH_ACCESS_KEY or not ADMIN_ID or not CHANNEL_ID:
-    raise RuntimeError("Environment variables BOT_TOKEN, UNSPLASH_ACCESS_KEY, ADMIN_ID, CHANNEL_ID must be set")
-
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(
-    level=LOG_LEVEL,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
-logger = logging.getLogger("music_channel_bot")
-
-router = Router()
-
-
-class PostStates(StatesGroup):
-    choosing_genre = State()
-    choosing_poll = State()
-
-
-GENRES = ["Pop", "Rock", "Hip-Hop", "Electronic"]
-POLL_TEMPLATES: list[dict[str, Any]] = [
-    {
-        "title": "Опитування 1",
-        "question": "Який жанр сьогодні найбільше під настрій?",
-        "options": ["Pop", "Rock", "Hip-Hop", "Electronic"],
-    },
-    {
-        "title": "Опитування 2",
-        "question": "Коли ти найчастіше слухаєш музику?",
-        "options": ["Вранці", "Вдень", "Увечері", "Вночі"],
-    },
-    {
-        "title": "Опитування 3",
-        "question": "Що додати в наступний музичний пост?",
-        "options": ["Більше новинок", "Локальних артистів", "Ретро-треків", "Електроніки"],
-    },
+RSS_FEEDS = [
+    "https://archive.org/services/collection-rss.php?collection=opensource_audio",
+    "https://freemusicarchive.org/playlist/rss",
 ]
 
-MUSIC_FEEDS = [
-    "https://freemusicarchive.org/genre/Pop.rss",
-    "https://freemusicarchive.org/genre/Rock.rss",
-    "https://freemusicarchive.org/genre/Hip-Hop.rss",
-    "https://freemusicarchive.org/genre/Electronic.rss",
-    "https://freemusicarchive.org/music.rss",
-]
+GENRES = ["Pop", "Rock", "Electronic", "Hip-Hop"]
+LANG_BUTTONS = {
+    "🇺🇦 Українська": "uk",
+    "🇷🇺 Російська": "ru",
+    "🇵🇱 Польська": "pl",
+}
+LANG_LABELS = {"uk": "українською", "ru": "російською", "pl": "польською"}
 
-QUOTE_FEEDS = [
-    "https://uk.wikiquote.org/w/api.php?action=query&list=random&rnnamespace=0&rnlimit=10&format=json",
-    "https://api.allorigins.win/raw?url=https://www.brainyquote.com/quote_of_the_day",
-]
-
-STATIC_UA_QUOTES = [
-    "Музика — це мова душі,\nяку неможливо підробити.\nВона лікує тишу.\nІ наповнює серце світлом.",
-    "Коли слова закінчуються,\nпочинається мелодія.\nВона веде крізь темряву\nдо м’якого спокою.",
-    "Справжній ритм життя\nчути не в годиннику,\nа в пульсі улюбленої пісні\nі теплій усмішці після неї.",
-    "У кожній пісні є частинка дому,\nнавіть якщо ти далеко.\nМузика пам’ятає нас\nкраще за будь-які фото.",
-]
-
-FALLBACK_TRACKS = [
-    {
-        "artist": "Kalush Orchestra",
-        "title": "Stefania (Instrumental Edit)",
-        "url": "https://files.freemusicarchive.org/storage-freemusicarchive-org/music/no_curator/Ketsa/Tides/Ketsa_-_01_-_Tides.mp3",
+LANGUAGE_KEYWORDS = {
+    "uk": {
+        "ukrainian",
+        "україн",
+        "uk",
+        "ua",
+        "україна",
     },
-    {
-        "artist": "Daria Zawiałow",
-        "title": "Polski Vibe Session",
-        "url": "https://files.freemusicarchive.org/storage-freemusicarchive-org/music/no_curator/Scott_Holmes_Music/Corporate__Motivational_Music/Scott_Holmes_Music_-_01_-_Our_Big_Adventure.mp3",
+    "ru": {
+        "russian",
+        "русск",
+        "рос",
+        "ru",
     },
-    {
-        "artist": "Miyagi & Andy Panda",
-        "title": "Northern Lights (Remix)",
-        "url": "https://files.freemusicarchive.org/storage-freemusicarchive-org/music/no_curator/BoxCat_Games/Nameless_the_Hackers_RPG_Soundtrack/BoxCat_Games_-_10_-_Battle_Boss.mp3",
+    "pl": {
+        "polish",
+        "polski",
+        "polska",
+        "поль",
+        "pl",
     },
-]
-
-GENRE_HINTS = {
-    "Pop": ["pop", "dance", "radio"],
-    "Rock": ["rock", "indie", "alt"],
-    "Hip-Hop": ["hip-hop", "rap", "trap"],
-    "Electronic": ["electronic", "edm", "house"],
 }
 
-pending_posts: dict[int, dict[str, Any]] = {}
-pending_polls: dict[int, dict[str, Any]] = {}
+POLL_TEMPLATES = [
+    {
+        "question": "Який жанр сьогодні найкраще пасує до настрою?",
+        "options": ["Pop", "Rock", "Electronic", "Hip-Hop"],
+    },
+    {
+        "question": "Що публікувати частіше?",
+        "options": ["Нові релізи", "Інді-артисти", "Саундтреки", "Ремікси"],
+    },
+    {
+        "question": "Яка мова треків вам ближча?",
+        "options": ["Українська", "Російська", "Польська", "Змішано"],
+    },
+    {
+        "question": "Коли вам зручніше читати пости?",
+        "options": ["Ранок", "День", "Вечір", "Ніч"],
+    },
+    {
+        "question": "Скільки треків оптимально в одному пості?",
+        "options": ["1", "2", "3", "4+"],
+    },
+]
+
+UK_QUOTES_SOURCES = {
+    "ukrainianpoetry": [
+        "І все на світі треба пережити,\nІ кожен фініш — це, по суті, старт.\nІ наперед не треба ворожити,\nІ за минулим плакати не варт.",
+        "Нації вмирають не від інфаркту.\nСпочатку їм відбирає мову.",
+        "Людина нібито не літає...\nА крила має. А крила має!",
+    ],
+    "ukrclassic": [
+        "Світ ловив мене, та не спіймав.",
+        "Як добре те, що смерті не боюсь я\nі не питаю, чи тяжкий мій хрест.",
+        "Борітеся — поборете,\nвам Бог помагає!",
+    ],
+}
+
+
+class CreatePostStates(StatesGroup):
+    choosing_genre = State()
+    choosing_language = State()
+    confirming_post = State()
+    choosing_poll = State()
+    confirming_poll = State()
 
 
 @dataclass
 class Track:
-    artist: str
     title: str
+    artist: str
     url: str
-    source: str
 
 
-MAIN_MENU = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text="🆕 Новий пост")],
-        [KeyboardButton(text="📊 Опитування")],
-        [KeyboardButton(text="❌ Скасувати")],
-    ],
-    resize_keyboard=True,
-    is_persistent=True,
-)
-
-GENRE_MENU = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text="Pop"), KeyboardButton(text="Rock")],
-        [KeyboardButton(text="Hip-Hop"), KeyboardButton(text="Electronic")],
-        [KeyboardButton(text="❌ Скасувати")],
-    ],
-    resize_keyboard=True,
-    is_persistent=True,
-)
-
-POLL_MENU = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text="Опитування 1")],
-        [KeyboardButton(text="Опитування 2")],
-        [KeyboardButton(text="Опитування 3")],
-        [KeyboardButton(text="❌ Скасувати")],
-    ],
-    resize_keyboard=True,
-    is_persistent=True,
-)
+def main_menu_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🎵 Новий пост"), KeyboardButton(text="📊 Опитування")],
+            [KeyboardButton(text="❌ Скасувати")],
+        ],
+        resize_keyboard=True,
+        input_field_placeholder="Оберіть дію",
+    )
 
 
-async def safe_feed_parse(url: str) -> feedparser.FeedParserDict:
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, lambda: feedparser.parse(url))
+def genre_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Pop"), KeyboardButton(text="Rock")],
+            [KeyboardButton(text="Electronic"), KeyboardButton(text="Hip-Hop")],
+            [KeyboardButton(text="❌ Скасувати")],
+        ],
+        resize_keyboard=True,
+    )
 
 
-def has_target_language(text: str) -> bool:
-    lower = text.lower()
-    if re.search(r"[іїєґ]", lower):
-        return True
-    if re.search(r"[а-яё]", lower):
-        return True
-    if re.search(r"[ąćęłńóśźż]", lower):
-        return True
+def language_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🇺🇦 Українська"), KeyboardButton(text="🇷🇺 Російська")],
+            [KeyboardButton(text="🇵🇱 Польська")],
+            [KeyboardButton(text="❌ Скасувати")],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def poll_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=f"Опитування {i}")] for i in range(1, 6)
+        ] + [[KeyboardButton(text="❌ Скасувати")]],
+        resize_keyboard=True,
+    )
+
+
+def confirm_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="✅ Опублікувати"), KeyboardButton(text="❌ Скасувати")],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def normalize_text(value: str) -> str:
+    value = value.lower()
+    value = re.sub(r"\s+", " ", value)
+    return value
+
+
+def language_match(entry_data: str, lang: str) -> bool:
+    data = normalize_text(entry_data)
+    for kw in LANGUAGE_KEYWORDS[lang]:
+        if re.search(rf"(^|[^a-zа-яіїєґ]){re.escape(kw)}([^a-zа-яіїєґ]|$)", data):
+            return True
     return False
 
 
-def parse_artist_title(raw_title: str) -> tuple[str, str]:
-    cleaned = re.sub(r"\s+", " ", raw_title or "").strip()
-    if not cleaned:
-        return "Unknown Artist", "Unknown Track"
-    for sep in (" - ", " — ", " – ", " | ", ": "):
-        if sep in cleaned:
-            left, right = cleaned.split(sep, 1)
-            if left.strip() and right.strip():
-                return left.strip(), right.strip()
-    return "Unknown Artist", cleaned
+def parse_rss_entries(raw: bytes, lang: str, genre: str | None = None) -> list[Track]:
+    parsed = feedparser.parse(raw)
+    tracks: list[Track] = []
+    genre_norm = normalize_text(genre) if genre else None
+
+    for entry in parsed.entries:
+        title = str(entry.get("title", "")).strip()
+        if not title:
+            continue
+
+        artist = (
+            str(entry.get("author", "")).strip()
+            or str(entry.get("artist", "")).strip()
+            or "Невідомий виконавець"
+        )
+        link = str(entry.get("link", "")).strip() or ""
+
+        tags = " ".join([str(t.get("term", "")) for t in entry.get("tags", [])])
+        pool = " ".join(
+            [
+                title,
+                artist,
+                str(entry.get("summary", "")),
+                str(entry.get("description", "")),
+                tags,
+                link,
+            ]
+        )
+        if not language_match(pool, lang):
+            continue
+        if genre_norm and genre_norm not in normalize_text(pool):
+            continue
+
+        tracks.append(Track(title=title[:120], artist=artist[:120], url=link))
+    return tracks
 
 
-def extract_audio_url(entry: Any) -> str:
-    links = entry.get("links", []) if isinstance(entry, dict) else getattr(entry, "links", [])
-    for link in links:
-        href = link.get("href", "")
-        mime = link.get("type", "")
-        if href and ("audio" in mime or href.lower().endswith(".mp3")):
-            return href
-    enclosures = entry.get("enclosures", []) if isinstance(entry, dict) else getattr(entry, "enclosures", [])
-    for enclosure in enclosures:
-        href = enclosure.get("href", "")
-        if href and href.lower().endswith(".mp3"):
-            return href
-    possible = entry.get("link", "") if isinstance(entry, dict) else getattr(entry, "link", "")
-    if possible and possible.lower().endswith(".mp3"):
-        return possible
-    return ""
+async def fetch_rss_tracks(
+    session: aiohttp.ClientSession,
+    lang: str,
+    genre: str | None,
+    limit: int = 2,
+) -> list[Track]:
+    result: list[Track] = []
+    seen: set[tuple[str, str]] = set()
+
+    for feed_url in RSS_FEEDS:
+        try:
+            async with session.get(feed_url, timeout=20) as resp:
+                if resp.status != 200:
+                    continue
+                raw = await resp.read()
+            entries = parse_rss_entries(raw, lang=lang, genre=genre)
+            for track in entries:
+                key = (track.title.lower(), track.artist.lower())
+                if key in seen:
+                    continue
+                seen.add(key)
+                result.append(track)
+                if len(result) >= limit:
+                    return result
+        except Exception:
+            logging.exception("RSS feed read failed: %s", feed_url)
+    return result
 
 
-async def collect_tracks(genre: str) -> tuple[list[Track], str | None]:
-    attempts = [
-        ("genre", GENRE_HINTS.get(genre, [genre.lower()])),
-        ("no_genre", []),
-        ("random_popular", ["popular", "top", "hit", "music"]),
-        ("at_least_one", []),
+async def fetch_jamendo_tracks(
+    session: aiohttp.ClientSession,
+    lang: str,
+    genre: str | None,
+    limit: int = 2,
+) -> list[Track]:
+    if not JAMENDO_CLIENT_ID:
+        return []
+
+    language_map = {"uk": "ukrainian", "ru": "russian", "pl": "polish"}
+    language_query = language_map[lang]
+    base_url = "https://api.jamendo.com/v3.0/tracks/"
+
+    params: dict[str, Any] = {
+        "client_id": JAMENDO_CLIENT_ID,
+        "format": "json",
+        "limit": max(10, limit * 5),
+        "include": "musicinfo",
+        "order": "popularity_total",
+        "audioformat": "mp31",
+        "search": language_query,
+    }
+    if genre:
+        params["tags"] = genre.lower()
+
+    try:
+        async with session.get(base_url, params=params, timeout=20) as resp:
+            if resp.status != 200:
+                return []
+            payload = await resp.json()
+    except Exception:
+        logging.exception("Jamendo request failed")
+        return []
+
+    data = payload.get("results", [])
+    tracks: list[Track] = []
+    for item in data:
+        title = str(item.get("name", "")).strip()
+        artist = str(item.get("artist_name", "")).strip() or "Невідомий виконавець"
+        track_url = str(item.get("audio", "")).strip() or str(item.get("shareurl", "")).strip()
+        pool = " ".join([title, artist, str(item.get("tags", "")), str(item.get("license_ccurl", ""))])
+        if not language_match(pool + f" {language_query}", lang):
+            continue
+        tracks.append(Track(title=title[:120], artist=artist[:120], url=track_url))
+        if len(tracks) >= limit:
+            break
+    return tracks
+
+
+async def search_tracks(session: aiohttp.ClientSession, genre: str, lang: str) -> list[Track]:
+    steps = [
+        {"genre": genre},
+        {"genre": None},
+        {"genre": None},
+        {"genre": None, "limit": 1},
     ]
 
-    for attempt_name, keywords in attempts:
-        tracks: list[Track] = []
-        seen_urls: set[str] = set()
-        random.shuffle(MUSIC_FEEDS)
+    tracks: list[Track] = []
+    for idx, step in enumerate(steps, start=1):
+        needed = 2 if idx < 4 else 1
+        if len(tracks) >= needed:
+            break
 
-        for feed_url in MUSIC_FEEDS:
-            try:
-                parsed = await safe_feed_parse(feed_url)
-            except Exception:
-                logger.exception("Failed to parse RSS feed: %s", feed_url)
-                continue
+        fetch_limit = step.get("limit", 2)
+        found = await fetch_rss_tracks(session, lang=lang, genre=step.get("genre"), limit=fetch_limit)
 
-            entries = parsed.entries[:20]
-            for entry in entries:
-                title = entry.get("title", "")
-                summary = (entry.get("summary", "") or "")
-                combined = f"{title} {summary}".lower()
+        if idx == 3 and len(found) < 2:
+            found = await fetch_jamendo_tracks(session, lang=lang, genre=None, limit=2)
+        elif idx == 4 and len(found) < 1:
+            found = await fetch_jamendo_tracks(session, lang=lang, genre=genre, limit=1)
 
-                if attempt_name == "genre" and keywords:
-                    if not any(keyword in combined for keyword in keywords):
-                        continue
+        uniq: dict[tuple[str, str], Track] = {(t.title.lower(), t.artist.lower()): t for t in tracks}
+        for item in found:
+            key = (item.title.lower(), item.artist.lower())
+            if key not in uniq:
+                uniq[key] = item
+        tracks = list(uniq.values())
 
-                artist, track_title = parse_artist_title(title)
-                if attempt_name != "at_least_one":
-                    if not has_target_language(f"{artist} {track_title}"):
-                        continue
+        if idx < 4 and len(tracks) >= 2:
+            return tracks[:2]
+        if idx == 4 and tracks:
+            return tracks[:2]
 
-                audio_url = extract_audio_url(entry)
-                if not audio_url or audio_url in seen_urls:
-                    continue
-
-                track = Track(artist=artist, title=track_title, url=audio_url, source=feed_url)
-                tracks.append(track)
-                seen_urls.add(audio_url)
-
-                if len(tracks) >= 3:
-                    break
-            if len(tracks) >= 3:
-                break
-
-        if len(tracks) >= 2:
-            if attempt_name != "genre":
-                return tracks[:3], attempt_name
-            return tracks[:3], None
-
-        if attempt_name == "at_least_one" and len(tracks) >= 1:
-            return tracks[:3], attempt_name
-
-    fallback_objs = [Track(**item, source="static_fallback") for item in FALLBACK_TRACKS]
-    return fallback_objs[:2], "random_popular"
+    return tracks[:2]
 
 
-async def fetch_quotes_ua(count: int = 2) -> list[str]:
-    quotes: list[str] = []
-
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
-        for url in QUOTE_FEEDS:
-            try:
-                async with session.get(url) as resp:
-                    if resp.status != 200:
-                        continue
-                    text = await resp.text()
-            except Exception:
-                logger.exception("Failed to get quote source: %s", url)
-                continue
-
-            chunks = re.split(r"[\n\r]+", re.sub(r"<[^>]+>", "\n", text))
-            for chunk in chunks:
-                line = re.sub(r"\s+", " ", chunk).strip(" .•\t")
-                if not line:
-                    continue
-                if not has_target_language(line):
-                    continue
-                if len(line) < 35:
-                    continue
-                lines = [seg.strip() for seg in re.split(r"(?<=[,.!?:;])\s+", line) if seg.strip()]
-                if len(lines) < 2:
-                    continue
-                selected = "\n".join(lines[:4])
-                if 2 <= selected.count("\n") + 1 <= 4:
-                    quotes.append(selected)
-                if len(quotes) >= count:
-                    return quotes[:count]
-
-    while len(quotes) < count:
-        quotes.append(random.choice(STATIC_UA_QUOTES))
-    return quotes[:count]
-
-
-async def download_file(url: str, suffix: str) -> str:
-    filename = f"{uuid.uuid4().hex}{suffix}"
-    path = str(Path(tempfile.gettempdir()) / filename)
-    timeout = aiohttp.ClientTimeout(total=45)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(url) as resp:
-            if resp.status != 200:
-                raise RuntimeError(f"Download failed with status {resp.status} for {url}")
-            data = await resp.read()
-            if not data:
-                raise RuntimeError(f"Empty response while downloading {url}")
-    with open(path, "wb") as f:
-        f.write(data)
-    return path
-
-
-async def fetch_unsplash_photo() -> str:
-    endpoint = "https://api.unsplash.com/photos/random"
+async def fetch_unsplash_photo(session: aiohttp.ClientSession, genre: str) -> str | None:
+    if not UNSPLASH_ACCESS_KEY:
+        return None
+    url = "https://api.unsplash.com/photos/random"
     params = {
-        "query": "music mood vibe aesthetic",
+        "query": f"moody {genre} music aesthetic",
         "orientation": "portrait",
         "content_filter": "high",
     }
     headers = {"Authorization": f"Client-ID {UNSPLASH_ACCESS_KEY}"}
-
-    timeout = aiohttp.ClientTimeout(total=30)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(endpoint, params=params, headers=headers) as resp:
+    try:
+        async with session.get(url, params=params, headers=headers, timeout=20) as resp:
             if resp.status != 200:
-                text = await resp.text()
-                raise RuntimeError(f"Unsplash API error {resp.status}: {text}")
-            payload = await resp.json()
-            image_url = payload.get("urls", {}).get("small") or payload.get("urls", {}).get("regular")
-            if not image_url:
-                raise RuntimeError("Unsplash response has no image URL")
+                return None
+            data = await resp.json()
+        return (
+            data.get("urls", {}).get("small")
+            or data.get("urls", {}).get("regular")
+            or data.get("urls", {}).get("thumb")
+        )
+    except Exception:
+        logging.exception("Unsplash request failed")
+        return None
 
-    return await download_file(image_url, ".jpg")
+
+def get_ukrainian_quote() -> str | None:
+    candidates: list[str] = []
+    for source_quotes in UK_QUOTES_SOURCES.values():
+        candidates.extend(source_quotes)
+    if not candidates:
+        return None
+    selected = random.choice(candidates)
+    lines = [line.strip() for line in selected.splitlines() if line.strip()]
+    if len(lines) < 2:
+        lines = [selected.strip(), ""]
+    if len(lines) > 4:
+        lines = lines[:4]
+    return "\n".join(lines).strip()
 
 
-async def fetch_channel_avatar(bot: Bot) -> str | None:
-    try:
-        chat = await bot.get_chat(CHANNEL_ID)
-        if not chat.photo:
+async def notify_admin(bot: Bot, text: str) -> None:
+    if ADMIN_ID:
+        try:
+            await bot.send_message(ADMIN_ID, text)
+        except TelegramBadRequest:
+            logging.exception("Failed to notify admin")
+
+
+async def build_post_data(bot: Bot, genre: str, lang: str) -> dict[str, Any] | None:
+    async with aiohttp.ClientSession() as session:
+        tracks = await search_tracks(session=session, genre=genre, lang=lang)
+        if not tracks:
+            await notify_admin(
+                bot,
+                f"⚠️ Не вдалося знайти треки {LANG_LABELS[lang]} через RSS/Jamendo.",
+            )
             return None
-        file_id = chat.photo.big_file_id
-        file = await bot.get_file(file_id)
-        path = str(Path(tempfile.gettempdir()) / f"channel_avatar_{uuid.uuid4().hex}.jpg")
-        await bot.download_file(file.file_path, destination=path)
-        return path
-    except TelegramAPIError:
-        logger.exception("Unable to fetch channel avatar")
-        return None
-    except Exception:
-        logger.exception("Unexpected error while fetching channel avatar")
-        return None
+
+        photo_url = await fetch_unsplash_photo(session=session, genre=genre)
+        quote = get_ukrainian_quote()
+
+        if not quote:
+            await notify_admin(bot, "⚠️ Джерела цитат недоступні.")
+            return None
+
+    tracks_text = "\n".join(
+        [
+            f"{idx}. 🎵 <b>{html.escape(track.title)}</b> — {html.escape(track.artist)}"
+            for idx, track in enumerate(tracks[:2], start=1)
+        ]
+    )
+    caption = f"{html.escape(quote)}\n\n{tracks_text}"
+
+    return {
+        "photo_url": photo_url,
+        "caption": caption,
+        "tracks_count": len(tracks[:2]),
+    }
 
 
-def ensure_admin(message: Message) -> bool:
-    return bool(message.from_user and message.from_user.id == ADMIN_ID)
+async def ensure_admin(message: Message) -> bool:
+    if message.from_user and message.from_user.id == ADMIN_ID:
+        return True
+    await message.answer("Ця команда доступна лише адміну.")
+    return False
 
 
-@router.message(CommandStart())
+async def reset_to_main(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer("Дію скасовано. Повертаю в головне меню.", reply_markup=main_menu_keyboard())
+
+
 async def start_handler(message: Message, state: FSMContext) -> None:
-    if not ensure_admin(message):
-        await message.answer("Доступ обмежено.")
+    if not await ensure_admin(message):
         return
     await state.clear()
-    await message.answer("Головне меню.", reply_markup=MAIN_MENU)
+    await message.answer(
+        "Вітаю! Оберіть дію в меню.",
+        reply_markup=main_menu_keyboard(),
+    )
 
 
-@router.message(F.text == "❌ Скасувати")
-async def cancel_handler(message: Message, state: FSMContext) -> None:
-    if not ensure_admin(message):
-        return
-    await state.clear()
-    pending_posts.pop(message.from_user.id, None)
-    pending_polls.pop(message.from_user.id, None)
-    await message.answer("Скасовано. Повернення в головне меню.", reply_markup=MAIN_MENU)
-
-
-@router.message(F.text == "🆕 Новий пост")
 async def new_post_handler(message: Message, state: FSMContext) -> None:
-    if not ensure_admin(message):
+    if not await ensure_admin(message):
         return
-    await state.set_state(PostStates.choosing_genre)
-    await message.answer("Оберіть жанр:", reply_markup=GENRE_MENU)
+    await state.set_state(CreatePostStates.choosing_genre)
+    await message.answer("Оберіть жанр:", reply_markup=genre_keyboard())
 
 
-@router.message(PostStates.choosing_genre, F.text.in_(GENRES))
-async def genre_selected_handler(message: Message, state: FSMContext, bot: Bot) -> None:
-    if not ensure_admin(message):
+async def genre_chosen_handler(message: Message, state: FSMContext) -> None:
+    genre = message.text or ""
+    if genre not in GENRES:
+        await message.answer("Будь ласка, оберіть жанр кнопками.")
+        return
+    await state.update_data(genre=genre)
+    await state.set_state(CreatePostStates.choosing_language)
+    await message.answer("Оберіть мову треків:", reply_markup=language_keyboard())
+
+
+async def language_chosen_handler(message: Message, state: FSMContext, bot: Bot) -> None:
+    lang_key = message.text or ""
+    if lang_key not in LANG_BUTTONS:
+        await message.answer("Будь ласка, оберіть мову кнопками.")
         return
 
-    genre = message.text
-    await message.answer("Формую пост, зачекайте...", reply_markup=MAIN_MENU)
+    await message.answer("Готую пост, зачекайте...", reply_markup=ReplyKeyboardRemove())
+    data = await state.get_data()
+    genre = data.get("genre")
+    lang = LANG_BUTTONS[lang_key]
 
-    photo_path = None
-    quote = None
-    audio_paths: list[str] = []
-    fallback_note = None
-
-    try:
-        tracks, fallback_mode = await collect_tracks(genre)
-        if fallback_mode:
-            fallback_note = {
-                "no_genre": "Використано fallback: пошук без жанру.",
-                "random_popular": "Використано fallback: random popular джерела.",
-                "at_least_one": "Використано fallback: знайдено мінімально доступні треки.",
-            }.get(fallback_mode, "Використано fallback для пошуку треків.")
-
-        if len(tracks) == 1:
-            tracks = [tracks[0], tracks[0]]
-        elif len(tracks) == 0:
-            tracks = [Track(**FALLBACK_TRACKS[0], source="static_fallback"), Track(**FALLBACK_TRACKS[1], source="static_fallback")]
-            fallback_note = "Використано аварійний fallback для треків."
-
-        tracks = tracks[:2]
-
-        quotes = await fetch_quotes_ua(count=2)
-        quote = random.choice(quotes)
-
-        photo_path = await fetch_unsplash_photo()
-
-        for track in tracks:
-            path = await download_file(track.url, ".mp3")
-            audio_paths.append(path)
-
-        post_id = message.from_user.id
-        pending_posts[post_id] = {
-            "photo": photo_path,
-            "quote": quote,
-            "audio": audio_paths,
-            "genre": genre,
-            "tracks": tracks,
-        }
-
-        publish_kb = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="✅ Опублікувати", callback_data="publish_post")],
-                [InlineKeyboardButton(text="❌ Скасувати", callback_data="cancel_post")],
-            ]
-        )
-
-        with open(photo_path, "rb"):
-            pass
-        await bot.send_photo(chat_id=ADMIN_ID, photo=FSInputFile(photo_path), caption=quote)
-
-        for track, path in zip(tracks, audio_paths, strict=False):
-            caption = f"<b>{track.title}</b>\n<i>{track.artist}</i>"
-            await bot.send_audio(chat_id=ADMIN_ID, audio=FSInputFile(path), caption=caption)
-
-        if fallback_note:
-            await message.answer(fallback_note)
-
-        await message.answer("Пост готовий. Опублікувати?", reply_markup=publish_kb)
-
-    except Exception as exc:
-        logger.exception("Failed to build post")
-        for p in [photo_path, *audio_paths]:
-            if p and os.path.exists(p):
-                os.remove(p)
-        await message.answer(f"Сталася помилка під час формування посту: {exc}", reply_markup=MAIN_MENU)
-    finally:
+    post_data = await build_post_data(bot=bot, genre=genre, lang=lang)
+    if not post_data:
         await state.clear()
-
-
-@router.callback_query(F.data == "cancel_post")
-async def cancel_post_callback(callback: Any, state: FSMContext) -> None:
-    user_id = callback.from_user.id
-    post = pending_posts.pop(user_id, None)
-    if post:
-        for p in [post.get("photo"), *(post.get("audio", []))]:
-            if p and os.path.exists(p):
-                os.remove(p)
-    await state.clear()
-    await callback.message.answer("Скасовано. Повернення в головне меню.", reply_markup=MAIN_MENU)
-    await callback.answer()
-
-
-@router.callback_query(F.data == "publish_post")
-async def publish_post_callback(callback: Any, bot: Bot, state: FSMContext) -> None:
-    user_id = callback.from_user.id
-    post = pending_posts.pop(user_id, None)
-    if not post:
-        await callback.answer("Пост не знайдено", show_alert=True)
+        await message.answer("Не вдалося сформувати пост. Спробуйте пізніше.", reply_markup=main_menu_keyboard())
         return
 
-    try:
-        await bot.send_photo(CHANNEL_ID, photo=FSInputFile(post["photo"]), caption=post["quote"])
-        for track, path in zip(post["tracks"], post["audio"], strict=False):
-            caption = f"<b>{track.title}</b>\n<i>{track.artist}</i>"
-            await bot.send_audio(CHANNEL_ID, audio=FSInputFile(path), caption=caption)
-        await callback.message.answer("Опубліковано в канал.", reply_markup=MAIN_MENU)
-        await callback.answer("Готово")
-    except Exception:
-        logger.exception("Failed to publish post")
-        await callback.answer("Помилка публікації", show_alert=True)
-    finally:
-        for p in [post.get("photo"), *(post.get("audio", []))]:
-            if p and os.path.exists(p):
-                os.remove(p)
-        await state.clear()
+    await state.update_data(
+        pending_post=post_data,
+        lang=lang,
+    )
+    await state.set_state(CreatePostStates.confirming_post)
+
+    photo_url = post_data.get("photo_url")
+    caption = post_data["caption"]
+    if photo_url:
+        try:
+            await message.answer_photo(photo=photo_url, caption=caption, parse_mode=ParseMode.HTML)
+        except Exception:
+            logging.exception("Preview photo failed, sending text")
+            await message.answer(caption, parse_mode=ParseMode.HTML)
+    else:
+        await notify_admin(bot, "⚠️ Unsplash недоступний, пост без фото в превʼю.")
+        await message.answer(caption, parse_mode=ParseMode.HTML)
+
+    await message.answer("Підтвердити публікацію?", reply_markup=confirm_keyboard())
 
 
-@router.message(F.text == "📊 Опитування")
-async def poll_menu_handler(message: Message, state: FSMContext) -> None:
-    if not ensure_admin(message):
-        return
-    await state.set_state(PostStates.choosing_poll)
-    await message.answer("Оберіть шаблон опитування:", reply_markup=POLL_MENU)
-
-
-@router.message(PostStates.choosing_poll, F.text.in_([p["title"] for p in POLL_TEMPLATES]))
-async def poll_selected_handler(message: Message, state: FSMContext, bot: Bot) -> None:
-    if not ensure_admin(message):
-        return
-
-    selected = next((p for p in POLL_TEMPLATES if p["title"] == message.text), None)
-    if not selected:
-        await message.answer("Шаблон не знайдено.", reply_markup=MAIN_MENU)
+async def publish_post_handler(message: Message, state: FSMContext, bot: Bot) -> None:
+    data = await state.get_data()
+    pending_post = data.get("pending_post")
+    if not pending_post:
+        await message.answer("Немає підготовленого поста.", reply_markup=main_menu_keyboard())
         await state.clear()
         return
 
+    photo_url = pending_post.get("photo_url")
+    caption = pending_post.get("caption", "")
+
     try:
-        await bot.send_poll(
-            chat_id=ADMIN_ID,
-            question=selected["question"],
-            options=selected["options"],
-            is_anonymous=False,
-        )
-
-        avatar_path = await fetch_channel_avatar(bot)
-        play_button = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="▶️ Програти пісню", url="https://files.freemusicarchive.org/storage-freemusicarchive-org/music/no_curator/Ketsa/Tides/Ketsa_-_01_-_Tides.mp3")]
-            ]
-        )
-
-        if avatar_path and os.path.exists(avatar_path):
-            await bot.send_photo(ADMIN_ID, photo=FSInputFile(avatar_path), caption="Кнопка програвання треку:", reply_markup=play_button)
-            os.remove(avatar_path)
+        if photo_url:
+            await bot.send_photo(CHANNEL_ID, photo=photo_url, caption=caption, parse_mode=ParseMode.HTML)
         else:
-            await message.answer("Кнопка програвання треку:", reply_markup=play_button)
-
-        control = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="✅ Опублікувати", callback_data="publish_poll")],
-                [InlineKeyboardButton(text="❌ Скасувати", callback_data="cancel_poll")],
-            ]
-        )
-
-        pending_polls[message.from_user.id] = selected
-        await message.answer("Опитування готове до публікації.", reply_markup=control)
+            await bot.send_message(CHANNEL_ID, caption, parse_mode=ParseMode.HTML)
     except Exception:
-        logger.exception("Failed to prepare poll")
-        await message.answer("Не вдалося створити опитування.", reply_markup=MAIN_MENU)
-    finally:
+        logging.exception("Failed to publish post")
+        await message.answer("Не вдалося опублікувати пост.", reply_markup=main_menu_keyboard())
         await state.clear()
+        return
 
-
-@router.callback_query(F.data == "cancel_poll")
-async def cancel_poll_callback(callback: Any, state: FSMContext) -> None:
-    pending_polls.pop(callback.from_user.id, None)
     await state.clear()
-    await callback.message.answer("Скасовано. Повернення в головне меню.", reply_markup=MAIN_MENU)
-    await callback.answer()
+    await message.answer("✅ Пост опубліковано.", reply_markup=main_menu_keyboard())
 
 
-@router.callback_query(F.data == "publish_poll")
-async def publish_poll_callback(callback: Any, bot: Bot, state: FSMContext) -> None:
-    selected = pending_polls.pop(callback.from_user.id, None)
-    if not selected:
-        await callback.answer("Опитування не знайдено", show_alert=True)
+async def polls_handler(message: Message, state: FSMContext) -> None:
+    if not await ensure_admin(message):
+        return
+    await state.set_state(CreatePostStates.choosing_poll)
+    await message.answer("Оберіть опитування:", reply_markup=poll_keyboard())
+
+
+async def poll_selected_handler(message: Message, state: FSMContext) -> None:
+    text = message.text or ""
+    match = re.fullmatch(r"Опитування (\d)", text)
+    if not match:
+        await message.answer("Оберіть опитування кнопками.")
+        return
+
+    idx = int(match.group(1)) - 1
+    if idx < 0 or idx >= len(POLL_TEMPLATES):
+        await message.answer("Такого опитування немає.")
+        return
+
+    poll = POLL_TEMPLATES[idx]
+    await state.update_data(selected_poll=poll)
+    await state.set_state(CreatePostStates.confirming_poll)
+    await message.answer(
+        f"Обрано: {text}\n\nПитання: {poll['question']}",
+        reply_markup=confirm_keyboard(),
+    )
+
+
+async def publish_poll_handler(message: Message, state: FSMContext, bot: Bot) -> None:
+    data = await state.get_data()
+    poll = data.get("selected_poll")
+    if not poll:
+        await message.answer("Немає обраного опитування.", reply_markup=main_menu_keyboard())
+        await state.clear()
         return
 
     try:
         await bot.send_poll(
             chat_id=CHANNEL_ID,
-            question=selected["question"],
-            options=selected["options"],
+            question=poll["question"],
+            options=poll["options"],
             is_anonymous=False,
         )
-        await callback.message.answer("Опитування опубліковано.", reply_markup=MAIN_MENU)
-        await callback.answer("Готово")
     except Exception:
-        logger.exception("Failed to publish poll")
-        await callback.answer("Помилка публікації", show_alert=True)
-    finally:
+        logging.exception("Failed to publish poll")
+        await message.answer("Не вдалося опублікувати опитування.", reply_markup=main_menu_keyboard())
         await state.clear()
-
-
-@router.message()
-async def fallback_handler(message: Message, state: FSMContext) -> None:
-    if not ensure_admin(message):
         return
-    current_state = await state.get_state()
-    if current_state == PostStates.choosing_genre.state:
-        await message.answer("Оберіть один із жанрів: Pop, Rock, Hip-Hop, Electronic.", reply_markup=GENRE_MENU)
-    elif current_state == PostStates.choosing_poll.state:
-        await message.answer("Оберіть Опитування 1, Опитування 2 або Опитування 3.", reply_markup=POLL_MENU)
-    else:
-        await message.answer("Оберіть дію з меню.", reply_markup=MAIN_MENU)
+
+    await state.clear()
+    await message.answer("✅ Опитування опубліковано.", reply_markup=main_menu_keyboard())
+
+
+async def cancel_handler(message: Message, state: FSMContext) -> None:
+    if not await ensure_admin(message):
+        return
+    await reset_to_main(message, state)
+
+
+def validate_env() -> None:
+    missing = [
+        name
+        for name, value in {
+            "BOT_TOKEN": BOT_TOKEN,
+            "UNSPLASH_ACCESS_KEY": UNSPLASH_ACCESS_KEY,
+            "ADMIN_ID": ADMIN_ID,
+            "CHANNEL_ID": CHANNEL_ID,
+            "JAMENDO_CLIENT_ID": JAMENDO_CLIENT_ID,
+        }.items()
+        if not value
+    ]
+    if missing:
+        raise RuntimeError(f"Missing required env vars: {', '.join(missing)}")
+
+
+async def on_startup(bot: Bot) -> None:
+    await notify_admin(bot, "✅ Бот запущено та готовий до роботи.")
 
 
 async def main() -> None:
-    bot = Bot(
-        token=BOT_TOKEN,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
-    dp = Dispatcher(storage=MemoryStorage())
-    dp.include_router(router)
+    validate_env()
 
-    logger.info("Bot started")
-    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
+    storage = MemoryStorage()
+    dp = Dispatcher(storage=storage)
+
+    dp.startup.register(on_startup)
+    dp.message.register(start_handler, CommandStart())
+    dp.message.register(cancel_handler, F.text == "❌ Скасувати")
+
+    dp.message.register(new_post_handler, F.text == "🎵 Новий пост")
+    dp.message.register(genre_chosen_handler, CreatePostStates.choosing_genre)
+    dp.message.register(language_chosen_handler, CreatePostStates.choosing_language)
+    dp.message.register(
+        publish_post_handler,
+        CreatePostStates.confirming_post,
+        F.text == "✅ Опублікувати",
+    )
+
+    dp.message.register(polls_handler, F.text == "📊 Опитування")
+    dp.message.register(poll_selected_handler, CreatePostStates.choosing_poll)
+    dp.message.register(
+        publish_poll_handler,
+        CreatePostStates.confirming_poll,
+        F.text == "✅ Опублікувати",
+    )
+
+    await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        logger.info("Bot stopped")
+        logging.info("Bot stopped")
