@@ -234,7 +234,7 @@ async def fetch_spotify_seed_data(
     token = await get_spotify_token(session)
     query = f"{genre} {language} music"
     headers = {"Authorization": f"Bearer {token}"}
-    params = {"q": query, "type": "track", "limit": "20", "market": "UA"}
+    params = {"q": query, "type": "track", "limit": "20"}
     async with session.get(
         "https://api.spotify.com/v1/search",
         params=params,
