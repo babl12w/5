@@ -56,8 +56,8 @@ logger = logging.getLogger("music-bot")
 
 router = Router()
 
-GENRES = ["Поп", "Рок", "Хіп-хоп", "Електроніка"]
-LANGUAGES = ["Українська", "Російська", "Польська"]
+GENRES = ["Pop", "Rok", "Rap", "Electronic"]
+LANGUAGES = ["ukrainian", "russian", "polish"]
 
 POLL_TEMPLATES: dict[str, dict[str, list[str] | str]] = {
     "Опитування 1": {
