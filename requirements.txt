@@ -1,4 +1,5 @@
-aiogram==3.13
-aiohttp
-feedparser
-yt-dlp
+aiogram==3.13.0
+aiohttp==3.10.5
+feedparser==6.0.11
+yt-dlp==2024.8.6
+imageio-ffmpeg==0.5.1
