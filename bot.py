@@ -3,308 +3,274 @@ import html
 import logging
 import os
 import random
-import re
+import shutil
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from xml.etree import ElementTree
 
 import aiohttp
-import feedparser
-from aiogram import Bot, Dispatcher, F, Router
+import yt_dlp
+from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import (
-    FSInputFile,
-    KeyboardButton,
-    Message,
-    ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
-)
-from imageio_ffmpeg import get_ffmpeg_exe
-from yt_dlp import YoutubeDL
+from aiogram.types import FSInputFile, KeyboardButton, Message, ReplyKeyboardMarkup
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-UNSPLASH_ACCESS_KEY = os.getenv("UNSPLASH_ACCESS_KEY", "")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-CHANNEL_ID = os.getenv("CHANNEL_ID", "")
-SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID", "")
-SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+ADMIN_ID_RAW = os.getenv("ADMIN_ID", "").strip()
+CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()
+UNSPLASH_ACCESS_KEY = os.getenv("UNSPLASH_ACCESS_KEY", "").strip()
+SPOTIFY_CLIENT_ID = os.getenv("spotify_CLIENT_ID", "").strip()
+SPOTIFY_CLIENT_SECRET = os.getenv("spotify_CLIENT_SECRET", "").strip()
 
-REQUIRED_ENVS = {
-    "BOT_TOKEN": BOT_TOKEN,
-    "UNSPLASH_ACCESS_KEY": UNSPLASH_ACCESS_KEY,
-    "ADMIN_ID": str(ADMIN_ID) if ADMIN_ID else "",
-    "CHANNEL_ID": CHANNEL_ID,
-    "SPOTIFY_CLIENT_ID": SPOTIFY_CLIENT_ID,
-    "SPOTIFY_CLIENT_SECRET": SPOTIFY_CLIENT_SECRET,
-}
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is not set")
+if not ADMIN_ID_RAW:
+    raise RuntimeError("ADMIN_ID is not set")
+if not CHANNEL_ID:
+    raise RuntimeError("CHANNEL_ID is not set")
+if not UNSPLASH_ACCESS_KEY:
+    raise RuntimeError("UNSPLASH_ACCESS_KEY is not set")
+if not SPOTIFY_CLIENT_ID:
+    raise RuntimeError("spotify_CLIENT_ID is not set")
+if not SPOTIFY_CLIENT_SECRET:
+    raise RuntimeError("spotify_CLIENT_SECRET is not set")
 
-missing = [name for name, value in REQUIRED_ENVS.items() if not value]
-if missing:
-    raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
+ADMIN_ID = int(ADMIN_ID_RAW)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
-logger = logging.getLogger("music-bot")
-
-router = Router()
-
-GENRES = ["Pop", "Rok", "Rap", "Electronic"]
-LANGUAGES = ["ukrainian", "russian", "polish"]
-
-POLL_TEMPLATES: dict[str, dict[str, list[str] | str]] = {
-    "Опитування 1": {
-        "question": "Який вайб сьогодні вмикаємо?",
-        "options": ["Chill", "Dance", "Rock", "Lo-fi"],
+GENRES = ["Pop", "Rock", "Hip-Hop", "Electronic"]
+LANGUAGES = ["Українська", "Російська", "Польська"]
+POLL_LIBRARY = [
+    {
+        "label": "Опитування 1",
+        "question": "Який настрій сьогодні пасує найбільше?",
+        "options": ["Спокійний", "Енергійний", "Романтичний", "Мрійливий"],
     },
-    "Опитування 2": {
-        "question": "Що хочете почути у наступному пості?",
-        "options": ["Свіжі новинки", "Класика", "Інді", "Мікс"],
+    {
+        "label": "Опитування 2",
+        "question": "Що хочете почути наступним постом?",
+        "options": ["Інді", "Поп", "Лоуфай", "Рок"],
     },
-    "Опитування 3": {
-        "question": "Якою мовою додати більше треків?",
-        "options": ["Українською", "Англійською", "Польською", "Без різниці"],
+    {
+        "label": "Опитування 3",
+        "question": "Коли вам зручно слухати музику?",
+        "options": ["Вранці", "Вдень", "Увечері", "Вночі"],
     },
-}
-
-QUOTE_RSS_SOURCES = [
-    "https://maximum.fm/rss",
-    "https://www.radiosvoboda.org/api/z$pryqqp$r",
-    "https://www.ukrinform.ua/rss/block-lastnews",
-    "https://life.pravda.com.ua/rss/",
 ]
 
-
-class PostStates(StatesGroup):
-    choosing_genre = State()
-    choosing_language = State()
-    preview_post = State()
+QUOTE_RSS_URL = "https://www.ukrinform.ua/rss/block-lastnews"
 
 
-class PollStates(StatesGroup):
-    choosing_template = State()
-    preview_poll = State()
+class PostFlow(StatesGroup):
+    choose_genre = State()
+    choose_language = State()
+    confirm_post = State()
 
 
-def main_menu() -> ReplyKeyboardMarkup:
+class PollFlow(StatesGroup):
+    choose_poll = State()
+    confirm_poll = State()
+
+
+@dataclass
+class TrackCandidate:
+    title: str
+    artist: str
+    search_query: str
+
+
+@dataclass
+class PreparedTrack:
+    title: str
+    artist: str
+    mp3_path: Path
+
+
+def menu_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="1️⃣ Новий пост")],
-            [KeyboardButton(text="2️⃣ Опитування")],
-            [KeyboardButton(text="3️⃣ Скасувати")],
+            [KeyboardButton(text="Новий пост")],
+            [KeyboardButton(text="Опитування")],
+            [KeyboardButton(text="Скасувати")],
         ],
         resize_keyboard=True,
     )
 
 
-def genre_menu() -> ReplyKeyboardMarkup:
+def genres_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text=GENRES[0]), KeyboardButton(text=GENRES[1])],
-            [KeyboardButton(text=GENRES[2]), KeyboardButton(text=GENRES[3])],
-            [KeyboardButton(text="3️⃣ Скасувати")],
-        ],
+        keyboard=[[KeyboardButton(text=genre)] for genre in GENRES] + [[KeyboardButton(text="Скасувати")]],
         resize_keyboard=True,
     )
 
 
-def language_menu() -> ReplyKeyboardMarkup:
+def languages_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text=LANGUAGES[0])],
-            [KeyboardButton(text=LANGUAGES[1])],
-            [KeyboardButton(text=LANGUAGES[2])],
-            [KeyboardButton(text="3️⃣ Скасувати")],
-        ],
+        keyboard=[[KeyboardButton(text=lang)] for lang in LANGUAGES] + [[KeyboardButton(text="Скасувати")]],
         resize_keyboard=True,
     )
 
 
-def publish_menu() -> ReplyKeyboardMarkup:
+def publish_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="Опублікувати")],
-            [KeyboardButton(text="3️⃣ Скасувати")],
-        ],
+        keyboard=[[KeyboardButton(text="Опублікувати")], [KeyboardButton(text="Скасувати")]],
         resize_keyboard=True,
     )
 
 
-def polls_menu() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="Опитування 1")],
-            [KeyboardButton(text="Опитування 2")],
-            [KeyboardButton(text="Опитування 3")],
-            [KeyboardButton(text="3️⃣ Скасувати")],
-        ],
-        resize_keyboard=True,
-    )
+def polls_keyboard() -> ReplyKeyboardMarkup:
+    poll_buttons = [[KeyboardButton(text=item["label"])] for item in POLL_LIBRARY]
+    poll_buttons.append([KeyboardButton(text="Скасувати")])
+    return ReplyKeyboardMarkup(keyboard=poll_buttons, resize_keyboard=True)
 
 
-def is_admin(message: Message) -> bool:
-    return bool(message.from_user and message.from_user.id == ADMIN_ID)
-
-
-async def cleanup_paths(paths: list[str]) -> None:
-    for raw in paths:
-        if not raw:
-            continue
-        path = Path(raw)
-        try:
-            if path.exists():
-                path.unlink()
-        except Exception as exc:
-            logger.warning("Failed to delete temp file %s: %s", path, exc)
-
-
-def sanitize_html_text(text: str) -> str:
-    clean = re.sub(r"<[^>]+>", " ", text or "")
-    clean = re.sub(r"\s+", " ", clean).strip()
-    return clean
-
-
-def text_to_quote(text: str) -> str | None:
-    raw = sanitize_html_text(text)
-    if len(raw) < 60:
-        return None
-    parts = [p.strip() for p in re.split(r"(?<=[.!?])\s+", raw) if p.strip()]
-    if not parts:
-        return None
-    lines = parts[:4]
-    if len(lines) < 2 and len(raw) > 80:
-        mid = len(raw) // 2
-        lines = [raw[:mid].strip(), raw[mid:].strip()]
-    lines = [line[:140].strip() for line in lines if line.strip()]
-    if not (2 <= len(lines) <= 4):
-        return None
-    return "\n".join(lines)
-
-
-async def fetch_quote(session: aiohttp.ClientSession) -> str:
-    random.shuffle(QUOTE_RSS_SOURCES)
-    for url in QUOTE_RSS_SOURCES:
-        try:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                if resp.status != 200:
-                    continue
-                xml = await resp.text()
-            parsed = feedparser.parse(xml)
-            entries = parsed.entries or []
-            random.shuffle(entries)
-            for entry in entries[:12]:
-                text = f"{entry.get('title', '')}. {entry.get('summary', '')}"
-                quote = text_to_quote(text)
-                if quote:
-                    return quote
-        except Exception as exc:
-            logger.warning("Quote RSS source failed (%s): %s", url, exc)
-    return "Музика збирає думки в ритм.\nНехай цей настрій тримає день."
+async def fetch_json(
+    session: aiohttp.ClientSession,
+    url: str,
+    *,
+    method: str = "GET",
+    params: dict[str, Any] | None = None,
+    headers: dict[str, str] | None = None,
+    data: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    timeout = aiohttp.ClientTimeout(total=40)
+    async with session.request(
+        method,
+        url,
+        params=params,
+        headers=headers,
+        data=data,
+        timeout=timeout,
+    ) as response:
+        response.raise_for_status()
+        return await response.json()
 
 
 async def get_spotify_token(session: aiohttp.ClientSession) -> str:
     payload = {"grant_type": "client_credentials"}
-    auth = aiohttp.BasicAuth(SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET)
+    timeout = aiohttp.ClientTimeout(total=30)
     async with session.post(
         "https://accounts.spotify.com/api/token",
         data=payload,
-        auth=auth,
-        timeout=aiohttp.ClientTimeout(total=20),
-    ) as resp:
-        resp.raise_for_status()
-        data = await resp.json()
-    token = data.get("access_token")
+        auth=aiohttp.BasicAuth(SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET),
+        timeout=timeout,
+    ) as response:
+        response.raise_for_status()
+        token_data = await response.json()
+    token = token_data.get("access_token")
     if not token:
-        raise RuntimeError("Spotify token was not received")
+        raise RuntimeError("Spotify token was not returned")
     return token
 
 
-async def fetch_spotify_seed_data(
+async def spotify_search_tracks(
     session: aiohttp.ClientSession,
-    genre: str,
-    language: str,
-) -> dict[str, str]:
-    token = await get_spotify_token(session)
-    query = f"{genre} {language} music"
+    token: str,
+    query: str,
+    limit: int = 8,
+) -> list[TrackCandidate]:
     headers = {"Authorization": f"Bearer {token}"}
-    params = {"q": query, "type": "track", "limit": "20"}
-    async with session.get(
+    data = await fetch_json(
+        session,
         "https://api.spotify.com/v1/search",
-        params=params,
+        params={"q": query, "type": "track", "limit": str(limit), "market": "UA"},
         headers=headers,
-        timeout=aiohttp.ClientTimeout(total=20),
-    ) as resp:
-        resp.raise_for_status()
-        data = await resp.json()
+    )
     items = data.get("tracks", {}).get("items", [])
-    if not items:
-        raise RuntimeError("Spotify did not return tracks")
-    item = random.choice(items)
-    track_name = item.get("name", "")
-    artists = item.get("artists") or []
-    artist_name = artists[0].get("name", "") if artists else ""
-    spotify_genre = genre
-
-    artist_id = artists[0].get("id") if artists else None
-    if artist_id:
-        async with session.get(
-            f"https://api.spotify.com/v1/artists/{artist_id}",
-            headers=headers,
-            timeout=aiohttp.ClientTimeout(total=20),
-        ) as resp:
-            if resp.status == 200:
-                adata = await resp.json()
-                genres = adata.get("genres") or []
-                if genres:
-                    spotify_genre = genres[0]
-
-    mood_map = {
-        "Поп": "energetic",
-        "Рок": "powerful",
-        "Хіп-хоп": "groovy",
-        "Електроніка": "dreamy",
-    }
-    mood = mood_map.get(genre, "vibe")
-    if track_name and artist_name:
-        return {"track": track_name, "artist": artist_name, "genre": spotify_genre, "mood": mood}
-    raise RuntimeError("Spotify result is incomplete")
-
-
-def extract_youtube_candidates(query: str, limit: int = 8) -> list[dict[str, str]]:
-    ydl_opts = {
-        "quiet": True,
-        "skip_download": True,
-        "extract_flat": "in_playlist",
-        "noplaylist": True,
-    }
-    with YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
-    entries = info.get("entries") or []
-    results: list[dict[str, str]] = []
-    for entry in entries:
-        video_id = entry.get("id")
-        title = entry.get("title") or "Unknown"
-        if not video_id:
+    candidates: list[TrackCandidate] = []
+    for item in items:
+        name = item.get("name")
+        artists = item.get("artists", [])
+        if not name or not artists:
             continue
-        url = f"https://www.youtube.com/watch?v={video_id}"
-        results.append({"title": title, "url": url})
-    return results
+        artist_name = artists[0].get("name", "Unknown")
+        candidates.append(TrackCandidate(title=name, artist=artist_name, search_query=f"{name} {artist_name} official audio"))
+    return candidates
 
 
-def download_mp3_from_youtube(url: str, output_dir: str) -> str:
-    ffmpeg_path = get_ffmpeg_exe()
+async def search_unsplash_photo(session: aiohttp.ClientSession, genre: str) -> Path:
+    headers = {"Authorization": f"Client-ID {UNSPLASH_ACCESS_KEY}"}
+    data = await fetch_json(
+        session,
+        "https://api.unsplash.com/photos/random",
+        params={"query": f"{genre} music vibe", "orientation": "landscape"},
+        headers=headers,
+    )
+    image_url = data.get("urls", {}).get("small") or data.get("urls", {}).get("regular")
+    if not image_url:
+        raise RuntimeError("Unsplash did not return image URL")
+
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+    temp_path = Path(temp_file.name)
+    temp_file.close()
+
+    async with session.get(image_url, timeout=aiohttp.ClientTimeout(total=45)) as response:
+        response.raise_for_status()
+        with temp_path.open("wb") as f:
+            while True:
+                chunk = await response.content.read(1024 * 64)
+                if not chunk:
+                    break
+                f.write(chunk)
+    return temp_path
+
+
+def extract_quote_from_rss(xml_text: str) -> str:
+    root = ElementTree.fromstring(xml_text)
+    texts: list[str] = []
+    for item in root.findall(".//item"):
+        title = (item.findtext("title") or "").strip()
+        description = (item.findtext("description") or "").strip()
+        combined = " ".join(part for part in [title, description] if part)
+        if len(combined) >= 60:
+            texts.append(combined)
+
+    if not texts:
+        texts = [
+            "Слухай серцем.\nКоли день шумить — музика збирає думки докупи.\nІ стає трохи тепліше.",
+        ]
+
+    raw = random.choice(texts)
+    clean = " ".join(raw.replace("\xa0", " ").split())
+
+    parts = [segment.strip() for segment in clean.replace("!", ".").split(".") if segment.strip()]
+    if len(parts) >= 4:
+        lines = parts[:4]
+    elif len(parts) >= 2:
+        lines = parts[:2]
+    else:
+        words = clean.split()
+        chunk_size = max(4, len(words) // 3)
+        lines = [" ".join(words[i : i + chunk_size]) for i in range(0, min(len(words), chunk_size * 3), chunk_size)]
+
+    lines = lines[:4]
+    if len(lines) < 2:
+        lines = ["Музика нагадує дихати глибше", "і знаходити світло в деталях"]
+
+    return "\n".join(html.escape(line) for line in lines)
+
+
+async def fetch_ukrainian_quote(session: aiohttp.ClientSession) -> str:
+    async with session.get(QUOTE_RSS_URL, timeout=aiohttp.ClientTimeout(total=25)) as response:
+        response.raise_for_status()
+        xml_text = await response.text()
+    return extract_quote_from_rss(xml_text)
+
+
+def yt_download_to_mp3(search_query: str, target_dir: Path) -> Path | None:
+    output_template = str(target_dir / "%(title).60s-%(id)s.%(ext)s")
     ydl_opts = {
         "format": "bestaudio/best",
-        "outtmpl": os.path.join(output_dir, "%(id)s.%(ext)s"),
-        "quiet": True,
+        "outtmpl": output_template,
         "noplaylist": True,
+        "default_search": "ytsearch1",
+        "quiet": True,
+        "no_warnings": True,
         "postprocessors": [
             {
                 "key": "FFmpegExtractAudio",
@@ -312,296 +278,323 @@ def download_mp3_from_youtube(url: str, output_dir: str) -> str:
                 "preferredquality": "192",
             }
         ],
-        "ffmpeg_location": ffmpeg_path,
     }
-    with YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        downloaded = Path(ydl.prepare_filename(info))
-    mp3_path = downloaded.with_suffix(".mp3")
-    if not mp3_path.exists():
-        candidates = sorted(Path(output_dir).glob("*.mp3"), key=lambda p: p.stat().st_mtime, reverse=True)
-        if not candidates:
-            raise RuntimeError("MP3 file was not created")
-        mp3_path = candidates[0]
-    return str(mp3_path)
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(search_query, download=True)
+        if not info:
+            return None
+        entry = info["entries"][0] if "entries" in info else info
+        downloaded = Path(ydl.prepare_filename(entry)).with_suffix(".mp3")
+        if downloaded.exists():
+            return downloaded
+
+    found_mp3 = sorted(target_dir.glob("*.mp3"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return found_mp3[0] if found_mp3 else None
 
 
-async def search_and_prepare_tracks(seed: dict[str, str]) -> list[dict[str, str]]:
+async def prepare_tracks_with_fallback(
+    session: aiohttp.ClientSession,
+    genre: str,
+    language: str,
+) -> list[PreparedTrack]:
+    token = await get_spotify_token(session)
+
     queries = [
-        f"{seed['artist']} {seed['track']} {seed['genre']} official audio",
-        f"{seed['artist']} {seed['track']} official audio",
-        "popular music hits official audio",
+        f"{genre} mood {language}",
+        f"music mood {language}",
+        "popular hits",
     ]
 
-    found: list[dict[str, str]] = []
-    seen_urls: set[str] = set()
+    tracks_dir = Path(tempfile.mkdtemp(prefix="tg_music_"))
+    prepared: list[PreparedTrack] = []
+    seen: set[str] = set()
 
     for query in queries:
-        candidates = await asyncio.to_thread(extract_youtube_candidates, query, 10)
-        for item in candidates:
-            if item["url"] in seen_urls:
+        spotify_tracks = await spotify_search_tracks(session, token, query, limit=10)
+        if not spotify_tracks:
+            continue
+
+        for candidate in spotify_tracks:
+            key = f"{candidate.title.lower()}::{candidate.artist.lower()}"
+            if key in seen:
                 continue
-            seen_urls.add(item["url"])
-            found.append(item)
-            if len(found) >= 2:
-                return found[:2]
-    return found[:2]
+            seen.add(key)
+
+            try:
+                mp3_path = await asyncio.to_thread(yt_download_to_mp3, candidate.search_query, tracks_dir)
+            except Exception as err:  # noqa: BLE001
+                logging.warning("YouTube extraction failed for %s: %s", candidate.search_query, err)
+                continue
+
+            if mp3_path and mp3_path.exists():
+                prepared.append(PreparedTrack(title=candidate.title, artist=candidate.artist, mp3_path=mp3_path))
+
+            if len(prepared) >= 2:
+                return prepared
+
+    return prepared
 
 
-async def prepare_post_assets(genre: str, language: str) -> dict[str, Any]:
-    async with aiohttp.ClientSession() as session:
-        seed = await fetch_spotify_seed_data(session, genre, language)
-        tracks = await search_and_prepare_tracks(seed)
-        if len(tracks) < 2:
-            raise RuntimeError("Не вдалося знайти 2 треки з YouTube.")
-
-        img_query = f"music {genre} {seed['mood']}"
-        headers = {"Authorization": f"Client-ID {UNSPLASH_ACCESS_KEY}"}
-        params = {"query": img_query, "orientation": "landscape"}
-        async with session.get(
-            "https://api.unsplash.com/photos/random",
-            params=params,
-            headers=headers,
-            timeout=aiohttp.ClientTimeout(total=20),
-        ) as resp:
-            resp.raise_for_status()
-            img_data = await resp.json()
-        image_url = img_data.get("urls", {}).get("small") or img_data.get("urls", {}).get("regular")
-        if not image_url:
-            raise RuntimeError("Unsplash не повернув зображення.")
-
-        async with session.get(image_url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
-            resp.raise_for_status()
-            image_bytes = await resp.read()
-
-        quote = await fetch_quote(session)
-
-    temp_dir = tempfile.mkdtemp(prefix="musicbot_")
-    image_path = Path(temp_dir) / "cover.jpg"
-    image_path.write_bytes(image_bytes)
-
-    prepared_tracks: list[dict[str, str]] = []
-    for idx, track in enumerate(tracks, start=1):
-        mp3_path = await asyncio.to_thread(download_mp3_from_youtube, track["url"], temp_dir)
-        prepared_tracks.append(
-            {
-                "title": track["title"],
-                "url": track["url"],
-                "file_path": mp3_path,
-                "label": f"🎵 Трек {idx}",
-            }
-        )
-
-    caption_tracks = "\n".join([item["label"] for item in prepared_tracks])
-    caption = f"<blockquote>{html.escape(quote)}</blockquote>\n\n{caption_tracks}"
-
-    return {
-        "image_path": str(image_path),
-        "tracks": prepared_tracks,
-        "caption": caption,
-        "temp_dir": temp_dir,
-    }
-
-
-async def send_post_preview(message: Message, payload: dict[str, Any]) -> None:
-    await message.answer_photo(
-        FSInputFile(payload["image_path"]),
-        caption=payload["caption"],
-        reply_markup=publish_menu(),
+async def notify_admin_not_enough_tracks(bot: Bot, genre: str, language: str) -> None:
+    text = (
+        "Вітаю! Не вдалося підготувати 2 треки для поста.\n"
+        f"Жанр: {genre}\n"
+        f"Мова: {language}\n"
+        "Спробовано fallback-запити Spotify/YouTube, але треків все ще недостатньо."
     )
-    for track in payload["tracks"]:
-        await message.answer_audio(
-            audio=FSInputFile(track["file_path"]),
-            title=track["title"][:64],
-        )
-
-
-async def publish_post(bot: Bot, payload: dict[str, Any]) -> None:
-    await bot.send_photo(chat_id=CHANNEL_ID, photo=FSInputFile(payload["image_path"]), caption=payload["caption"])
-    for track in payload["tracks"]:
-        await bot.send_audio(chat_id=CHANNEL_ID, audio=FSInputFile(track["file_path"]), title=track["title"][:64])
-
-
-@router.message(CommandStart())
-async def cmd_start(message: Message, state: FSMContext) -> None:
-    if not is_admin(message):
-        await message.answer("Доступ заборонено.", reply_markup=ReplyKeyboardRemove())
-        return
-    await state.clear()
-    await message.answer("Вітаю! Оберіть дію:", reply_markup=main_menu())
-
-
-@router.message(F.text == "1️⃣ Новий пост")
-async def new_post(message: Message, state: FSMContext) -> None:
-    if not is_admin(message):
-        return
-    await state.clear()
-    await state.set_state(PostStates.choosing_genre)
-    await message.answer("Оберіть жанр:", reply_markup=genre_menu())
-
-
-@router.message(PostStates.choosing_genre, F.text.in_(GENRES))
-async def choose_genre(message: Message, state: FSMContext) -> None:
-    await state.update_data(genre=message.text)
-    await state.set_state(PostStates.choosing_language)
-    await message.answer("Оберіть мову:", reply_markup=language_menu())
-
-
-@router.message(PostStates.choosing_language, F.text.in_(LANGUAGES))
-async def choose_language(message: Message, state: FSMContext) -> None:
-    data = await state.get_data()
-    genre = data.get("genre")
-    language = message.text
-    await message.answer("Готую превʼю поста, зачекайте...", reply_markup=ReplyKeyboardRemove())
-
-    payload: dict[str, Any] | None = None
     try:
-        payload = await prepare_post_assets(genre=genre, language=language)
-        await send_post_preview(message, payload)
-        await state.update_data(post_payload=payload)
-        await state.set_state(PostStates.preview_post)
-    except Exception as exc:
-        logger.exception("Post preparation failed: %s", exc)
-        if payload:
-            await cleanup_paths(
-                [payload.get("image_path", "")]
-                + [track.get("file_path", "") for track in payload.get("tracks", [])]
-            )
-            temp_dir = payload.get("temp_dir")
-            if temp_dir:
-                Path(temp_dir).rmdir()
+        await bot.send_message(ADMIN_ID, text)
+    except Exception as err:  # noqa: BLE001
+        logging.error("Cannot notify admin: %s", err)
+
+
+async def cleanup_temp_files(state: FSMContext) -> None:
+    data = await state.get_data()
+    photo_path = data.get("photo_path")
+    track_paths = data.get("track_paths", [])
+    temp_dir = data.get("temp_dir")
+
+    for raw_path in track_paths:
+        path = Path(raw_path)
+        if path.exists():
+            path.unlink(missing_ok=True)
+
+    if photo_path:
+        photo = Path(photo_path)
+        if photo.exists():
+            photo.unlink(missing_ok=True)
+
+    if temp_dir:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+async def show_main_menu(message: Message, text: str = "Вітаю! Оберіть дію:") -> None:
+    await message.answer(text, reply_markup=menu_keyboard())
+
+
+async def cmd_start(message: Message, state: FSMContext) -> None:
+    await cleanup_temp_files(state)
+    await state.clear()
+    await show_main_menu(message)
+
+
+async def cancel_action(message: Message, state: FSMContext) -> None:
+    await cleanup_temp_files(state)
+    await state.clear()
+    await show_main_menu(message, "Дію скасовано. Оберіть нову дію:")
+
+
+async def new_post_entry(message: Message, state: FSMContext) -> None:
+    await cleanup_temp_files(state)
+    await state.clear()
+    await state.set_state(PostFlow.choose_genre)
+    await message.answer("Оберіть жанр:", reply_markup=genres_keyboard())
+
+
+async def choose_genre_handler(message: Message, state: FSMContext) -> None:
+    genre = (message.text or "").strip()
+    if genre not in GENRES:
+        await message.answer("Будь ласка, оберіть жанр кнопкою.", reply_markup=genres_keyboard())
+        return
+
+    await state.update_data(genre=genre)
+    await state.set_state(PostFlow.choose_language)
+    await message.answer("Оберіть мову:", reply_markup=languages_keyboard())
+
+
+async def choose_language_handler(message: Message, state: FSMContext, bot: Bot) -> None:
+    language = (message.text or "").strip()
+    if language not in LANGUAGES:
+        await message.answer("Будь ласка, оберіть мову кнопкою.", reply_markup=languages_keyboard())
+        return
+
+    data = await state.get_data()
+    genre = data.get("genre", "Pop")
+
+    await message.answer("Готую прев'ю поста, зачекайте кілька секунд...")
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            tracks = await prepare_tracks_with_fallback(session, genre=genre, language=language)
+            if len(tracks) < 2:
+                await notify_admin_not_enough_tracks(bot, genre=genre, language=language)
+                for track in tracks:
+                    track.mp3_path.unlink(missing_ok=True)
+                await message.answer(
+                    "На жаль, зараз не вдалося знайти 2 треки. Спробуйте ще раз трохи пізніше.",
+                    reply_markup=menu_keyboard(),
+                )
+                await state.clear()
+                return
+
+            photo_path = await search_unsplash_photo(session, genre=genre)
+            quote = await fetch_ukrainian_quote(session)
+    except Exception as err:  # noqa: BLE001
+        logging.exception("Error preparing post preview: %s", err)
+        await message.answer("Сталася помилка під час підготовки поста. Спробуйте ще раз.", reply_markup=menu_keyboard())
         await state.clear()
-        await message.answer(
-            "Не вдалося підготувати пост. Спробуйте ще раз пізніше.",
-            reply_markup=main_menu(),
+        return
+
+    temp_dir = str(Path(tracks[0].mp3_path).parent)
+    caption = quote
+
+    await state.update_data(
+        language=language,
+        quote=caption,
+        photo_path=str(photo_path),
+        track_paths=[str(track.mp3_path) for track in tracks],
+        track_titles=[track.title for track in tracks],
+        track_artists=[track.artist for track in tracks],
+        temp_dir=temp_dir,
+    )
+
+    await message.answer("Прев'ю готове:")
+    await message.answer_photo(photo=FSInputFile(photo_path), caption=caption)
+
+    for track in tracks[:2]:
+        await message.answer_audio(
+            audio=FSInputFile(track.mp3_path),
+            title=track.title,
+            performer=track.artist,
         )
 
+    await state.set_state(PostFlow.confirm_post)
+    await message.answer("Опублікувати пост у канал?", reply_markup=publish_keyboard())
 
-@router.message(PostStates.preview_post, F.text == "Опублікувати")
+
 async def publish_post_handler(message: Message, state: FSMContext, bot: Bot) -> None:
     data = await state.get_data()
-    payload = data.get("post_payload")
-    if not payload:
-        await state.clear()
-        await message.answer("Немає підготовленого поста.", reply_markup=main_menu())
+    if not data:
+        await show_main_menu(message)
         return
 
     try:
-        await publish_post(bot, payload)
-        await message.answer("Пост опубліковано ✅", reply_markup=main_menu())
-    except TelegramAPIError as exc:
-        logger.exception("Publishing post failed: %s", exc)
-        await message.answer("Помилка публікації поста.", reply_markup=main_menu())
-    finally:
-        await cleanup_paths(
-            [payload.get("image_path", "")]
-            + [track.get("file_path", "") for track in payload.get("tracks", [])]
-        )
-        temp_dir = payload.get("temp_dir")
-        if temp_dir:
-            try:
-                Path(temp_dir).rmdir()
-            except Exception:
-                pass
+        photo_path = Path(data["photo_path"])
+        quote = data["quote"]
+        track_paths = [Path(path) for path in data.get("track_paths", [])]
+        titles = data.get("track_titles", [])
+        artists = data.get("track_artists", [])
+
+        await bot.send_photo(CHANNEL_ID, photo=FSInputFile(photo_path), caption=quote)
+        for i, path in enumerate(track_paths[:2]):
+            await bot.send_audio(
+                CHANNEL_ID,
+                audio=FSInputFile(path),
+                title=titles[i] if i < len(titles) else "Track",
+                performer=artists[i] if i < len(artists) else "Unknown",
+            )
+    except Exception as err:  # noqa: BLE001
+        logging.exception("Error while publishing post: %s", err)
+        await message.answer("Не вдалося опублікувати пост. Спробуйте ще раз.", reply_markup=menu_keyboard())
+        await cleanup_temp_files(state)
         await state.clear()
-
-
-@router.message(F.text == "2️⃣ Опитування")
-async def polls_start(message: Message, state: FSMContext) -> None:
-    if not is_admin(message):
         return
+
+    await message.answer("Готово! Пост миттєво опубліковано ✅", reply_markup=menu_keyboard())
+    await cleanup_temp_files(state)
     await state.clear()
-    await state.set_state(PollStates.choosing_template)
-    await message.answer("Оберіть шаблон опитування:", reply_markup=polls_menu())
 
 
-@router.message(PollStates.choosing_template, F.text.in_(list(POLL_TEMPLATES.keys())))
-async def poll_template_selected(message: Message, state: FSMContext) -> None:
-    template = POLL_TEMPLATES[message.text]
-    await state.update_data(selected_poll=template)
-    await state.set_state(PollStates.preview_poll)
-    options_text = "\n".join([f"• {opt}" for opt in template["options"]])
+async def poll_entry(message: Message, state: FSMContext) -> None:
+    await cleanup_temp_files(state)
+    await state.clear()
+    await state.set_state(PollFlow.choose_poll)
+    await message.answer("Оберіть заготовлене опитування:", reply_markup=polls_keyboard())
+
+
+async def choose_poll_handler(message: Message, state: FSMContext) -> None:
+    selected = (message.text or "").strip()
+    poll = next((item for item in POLL_LIBRARY if item["label"] == selected), None)
+    if not poll:
+        await message.answer("Будь ласка, оберіть опитування кнопкою.", reply_markup=polls_keyboard())
+        return
+
+    await state.update_data(poll_label=poll["label"], poll_question=poll["question"], poll_options=poll["options"])
+    await state.set_state(PollFlow.confirm_poll)
+
+    options_preview = "\n".join(f"• {html.escape(opt)}" for opt in poll["options"])
     await message.answer(
-        f"Превʼю опитування:\n\n{template['question']}\n{options_text}",
-        reply_markup=publish_menu(),
+        f"Прев'ю:\n<b>{html.escape(poll['question'])}</b>\n{options_preview}",
+        reply_markup=publish_keyboard(),
     )
 
 
-@router.message(PollStates.preview_poll, F.text == "Опублікувати")
 async def publish_poll_handler(message: Message, state: FSMContext, bot: Bot) -> None:
     data = await state.get_data()
-    selected_poll = data.get("selected_poll")
-    if not selected_poll:
-        await state.clear()
-        await message.answer("Немає підготовленого опитування.", reply_markup=main_menu())
+    if not data:
+        await show_main_menu(message)
         return
 
     try:
         await bot.send_poll(
             chat_id=CHANNEL_ID,
-            question=selected_poll["question"],
-            options=selected_poll["options"],
+            question=data["poll_question"],
+            options=data["poll_options"],
             is_anonymous=True,
         )
-        await message.answer("Опитування опубліковано ✅", reply_markup=main_menu())
-    except TelegramAPIError as exc:
-        logger.exception("Publishing poll failed: %s", exc)
-        await message.answer("Помилка публікації опитування.", reply_markup=main_menu())
-    finally:
+    except Exception as err:  # noqa: BLE001
+        logging.exception("Error while publishing poll: %s", err)
+        await message.answer("Не вдалося опублікувати опитування. Спробуйте ще раз.", reply_markup=menu_keyboard())
         await state.clear()
+        return
 
-
-@router.message(F.text == "3️⃣ Скасувати")
-@router.message(F.text == "Скасувати")
-async def cancel_handler(message: Message, state: FSMContext) -> None:
-    data = await state.get_data()
-    payload = data.get("post_payload")
-    if payload:
-        await cleanup_paths(
-            [payload.get("image_path", "")]
-            + [track.get("file_path", "") for track in payload.get("tracks", [])]
-        )
-        temp_dir = payload.get("temp_dir")
-        if temp_dir:
-            try:
-                Path(temp_dir).rmdir()
-            except Exception:
-                pass
-
+    await message.answer("Опитування опубліковано ✅", reply_markup=menu_keyboard())
     await state.clear()
-    await message.answer("Скасовано.", reply_markup=main_menu())
 
 
-@router.message()
-async def fallback(message: Message, state: FSMContext) -> None:
+async def fallback_unhandled(message: Message, state: FSMContext) -> None:
     current = await state.get_state()
-    if current in {PostStates.choosing_genre.state, PostStates.choosing_language.state}:
-        await message.answer("Будь ласка, використайте кнопки для вибору.")
-        return
-    if current in {PostStates.preview_post.state, PollStates.preview_poll.state}:
-        await message.answer("Натисніть 'Опублікувати' або '3️⃣ Скасувати'.")
-        return
-    await message.answer("Оберіть дію з меню.", reply_markup=main_menu())
+    if current in {PostFlow.choose_genre.state, PostFlow.choose_language.state, PostFlow.confirm_post.state}:
+        await message.answer("Скористайтесь кнопками нижче для продовження або скасування.")
+    elif current in {PollFlow.choose_poll.state, PollFlow.confirm_poll.state}:
+        await message.answer("Скористайтесь кнопками нижче для вибору опитування або скасування.")
+    else:
+        await show_main_menu(message, "Оберіть дію через меню нижче:")
 
 
-async def on_startup(bot: Bot) -> None:
-    logger.info("Bot started as @%s", (await bot.get_me()).username)
+async def on_shutdown(dispatcher: Dispatcher, bot: Bot) -> None:
+    logging.info("Shutting down bot...")
+    await bot.session.close()
+
+
+def build_dispatcher() -> Dispatcher:
+    dp = Dispatcher(storage=MemoryStorage())
+
+    dp.message.register(cmd_start, CommandStart())
+    dp.message.register(cancel_action, F.text == "Скасувати")
+
+    dp.message.register(new_post_entry, F.text == "Новий пост")
+    dp.message.register(choose_genre_handler, PostFlow.choose_genre)
+    dp.message.register(choose_language_handler, PostFlow.choose_language)
+    dp.message.register(publish_post_handler, PostFlow.confirm_post, F.text == "Опублікувати")
+
+    dp.message.register(poll_entry, F.text == "Опитування")
+    dp.message.register(choose_poll_handler, PollFlow.choose_poll)
+    dp.message.register(publish_poll_handler, PollFlow.confirm_poll, F.text == "Опублікувати")
+
+    dp.message.register(fallback_unhandled)
+    return dp
 
 
 async def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    )
+
     bot = Bot(
         token=BOT_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
-    dp = Dispatcher(storage=MemoryStorage())
-    dp.include_router(router)
-    dp.startup.register(on_startup)
+    dp = build_dispatcher()
+    dp.shutdown.register(on_shutdown)
 
-    try:
-        await dp.start_polling(bot)
-    finally:
-        await bot.session.close()
+    logging.info("Bot started")
+    await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logging.info("Bot stopped")
