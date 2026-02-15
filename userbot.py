@@ -2,10 +2,11 @@ import asyncio
 import os
 import tempfile
 from pathlib import Path
+from typing import Optional
 
-from pyrogram import Client, filters
-from pyrogram.enums import MessageMediaType
-from pyrogram.types import Message
+from pyrogram import Client
+from pyrogram.enums import ChatAction
+from pyrogram.errors import RPCError
 
 
 class TgSoundUserbot:
@@ -15,68 +16,52 @@ class TgSoundUserbot:
         session_string = os.getenv("SESSION_STRING")
 
         if not api_id_raw or not api_hash or not session_string:
-            raise RuntimeError("API_ID, API_HASH, SESSION_STRING must be set")
+            raise RuntimeError("API_ID, API_HASH, SESSION_STRING are required")
 
-        self._api_id = int(api_id_raw)
-        self._api_hash = api_hash
-        self._session_string = session_string
-        self._client = Client(
-            name="music_userbot",
-            api_id=self._api_id,
-            api_hash=self._api_hash,
-            session_string=self._session_string,
+        self.api_id = int(api_id_raw)
+        self.api_hash = api_hash
+        self.session_string = session_string
+        self.client = Client(
+            name="music_channel_userbot",
+            api_id=self.api_id,
+            api_hash=self.api_hash,
+            session_string=self.session_string,
             in_memory=True,
-            no_updates=False,
         )
+        self._lock = asyncio.Lock()
 
     async def start(self) -> None:
-        if not self._client.is_connected:
-            await self._client.start()
+        await self.client.start()
 
     async def stop(self) -> None:
-        if self._client.is_connected:
-            await self._client.stop()
+        await self.client.stop()
 
-    async def _wait_for_audio(self, timeout: int = 40) -> Message:
-        deadline = asyncio.get_running_loop().time() + timeout
-        while True:
-            remaining = deadline - asyncio.get_running_loop().time()
-            if remaining <= 0:
-                raise TimeoutError("Timed out waiting for audio from @TgSoundBot")
+    async def fetch_mp3(self, title: str, artist: str, timeout: int = 90) -> Optional[str]:
+        query = f"{title} {artist}".strip()
+        async with self._lock:
+            try:
+                await self.client.send_chat_action("TgSoundBot", ChatAction.TYPING)
+                await self.client.send_message("TgSoundBot", query)
+            except RPCError:
+                return None
 
-            message = await self._client.listen(
-                chat_id="TgSoundBot",
-                filters=filters.chat("TgSoundBot"),
-                timeout=int(max(1, remaining)),
-            )
+            end_time = asyncio.get_running_loop().time() + timeout
+            seen_ids: set[int] = set()
 
-            if message.media in (MessageMediaType.AUDIO, MessageMediaType.DOCUMENT):
-                if message.audio:
-                    return message
-                if message.document and (message.document.mime_type or "").startswith("audio/"):
-                    return message
+            while asyncio.get_running_loop().time() < end_time:
+                try:
+                    async for message in self.client.get_chat_history("TgSoundBot", limit=15):
+                        if message.id in seen_ids:
+                            continue
+                        seen_ids.add(message.id)
+                        if message.audio and message.from_user and message.from_user.is_bot:
+                            directory = Path(tempfile.mkdtemp(prefix="tgsound_"))
+                            target = directory / f"{message.audio.file_unique_id}.mp3"
+                            downloaded = await self.client.download_media(message, file_name=str(target))
+                            return downloaded
+                except RPCError:
+                    return None
 
-            if message.reply_markup and message.reply_markup.inline_keyboard:
-                for row in message.reply_markup.inline_keyboard:
-                    for button in row:
-                        if button.callback_data or button.url:
-                            try:
-                                await message.click(button.text)
-                                break
-                            except Exception:
-                                continue
-                    else:
-                        continue
-                    break
+                await asyncio.sleep(2)
 
-    async def find_track_mp3(self, artist: str, title: str) -> str:
-        query = f"{artist} - {title}"
-        await self._client.send_message("TgSoundBot", query)
-        audio_message = await self._wait_for_audio()
-
-        suffix = ".mp3"
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            temp_path = Path(tmp.name)
-
-        await self._client.download_media(audio_message, file_name=str(temp_path))
-        return str(temp_path)
+            return None
