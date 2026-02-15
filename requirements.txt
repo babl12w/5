@@ -1,6 +1,7 @@
 aiogram==3.13.0
-Pyrogram==2.0.106
-aiohttp==3.10.5
-requests==2.32.3
-feedparser==6.0.11
-python-dotenv==1.0.1
+Pyrogram>=2.0.0
+tgcrypto>=1.2.5
+aiohttp>=3.9.0
+requests>=2.31.0
+feedparser>=6.0.11
+python-dotenv>=1.0.1
